@@ -1,0 +1,76 @@
+" Minimal Vim config with built-in clipboard support.
+
+set encoding=utf-8
+scriptencoding utf-8
+
+syntax on
+filetype plugin indent on
+
+set background=dark
+if has('termguicolors')
+  set termguicolors
+endif
+silent! colorscheme gruvbox
+
+set number
+set relativenumber
+set cursorline
+set signcolumn=yes
+set scrolloff=6
+set nowrap
+set title
+set laststatus=2
+set mouse=a
+set splitright
+set splitbelow
+set wildmenu
+set wildmode=longest:full,full
+set hidden
+set showmatch
+set ignorecase
+set smartcase
+set incsearch
+set hlsearch
+set updatetime=300
+set shortmess+=c
+set backspace=indent,eol,start
+
+set tabstop=2
+set softtabstop=2
+set shiftwidth=2
+set expandtab
+set autoindent
+set smartindent
+
+if has('persistent_undo')
+  set undofile
+  if !isdirectory($HOME . "/.vim/undo")
+    silent! call mkdir($HOME . "/.vim/undo", "p")
+  endif
+  set undodir=~/.vim/undo
+endif
+
+if has('clipboard')
+  set clipboard=unnamed,unnamedplus
+endif
+
+let mapleader=" "
+
+nnoremap <C-h> <C-w>h
+nnoremap <C-j> <C-w>j
+nnoremap <C-k> <C-w>k
+nnoremap <C-l> <C-w>l
+
+nnoremap <leader>w :w<CR>
+nnoremap <leader><space> :nohlsearch<CR>
+nnoremap <leader>e :Lex 20<CR>
+nnoremap <leader>yf :let @+=expand('%:p')<CR>:echo "Copied file path"<CR>
+nnoremap <leader>yd :let @+=expand('%:p:h')<CR>:echo "Copied directory"<CR>
+
+augroup dotfiles_vim
+  autocmd!
+  autocmd BufWritePre * if &filetype !~# 'markdown' | %s/\s\+$//e | endif
+  autocmd BufReadPost * if line("'\"") > 0 && line("'\"") <= line("$") | execute "normal! g'\"" | endif
+  autocmd FileType python setlocal tabstop=4 softtabstop=4 shiftwidth=4 expandtab
+  autocmd FileType javascript,typescript,tsx,jsx,html,css setlocal tabstop=2 softtabstop=2 shiftwidth=2 expandtab
+augroup END

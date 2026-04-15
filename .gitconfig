@@ -1,0 +1,14 @@
+[user]
+	name = Yigit Gunduc
+	email = ygunduc+git@gmail.com
+[pull]
+	rebase = true
+[fetch]
+	prune = true
+[init]
+	defaultBranch = master
+[alias]
+	st = status -sb
+	co = checkout
+	br = branch
+	lg = log --graph --decorate --oneline --all

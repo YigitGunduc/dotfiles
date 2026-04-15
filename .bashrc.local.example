@@ -1,0 +1,7 @@
+# Machine-specific interactive Bash tweaks.
+# This file is intentionally not linked by install.sh.
+# Copy to ~/.bashrc.local on machines where you want local-only settings.
+
+# Example:
+# export PATH="$HOME/.cargo/bin:$PATH"
+# alias workrepo='cd ~/Developer/some-machine-only-repo'

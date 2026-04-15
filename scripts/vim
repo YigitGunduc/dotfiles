@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+
+real_vim="/usr/bin/vim"
+
+if [ "$#" -eq 0 ] && [ -t 0 ] && [ -t 1 ]; then
+  files=()
+
+  while IFS= read -r -d '' file; do
+    files+=("$file")
+  done < <(fzf -m --print0)
+
+  [ "${#files[@]}" -gt 0 ] || exit 0
+
+  exec "$real_vim" "${files[@]}"
+fi
+
+exec "$real_vim" "$@"

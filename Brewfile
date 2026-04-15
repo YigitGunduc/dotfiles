@@ -1,0 +1,7 @@
+brew "bat"
+brew "bash-completion"
+brew "colordiff"
+brew "fd"
+brew "fzf"
+brew "ripgrep"
+brew "zoxide"
