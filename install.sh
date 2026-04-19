@@ -175,8 +175,10 @@ if [ "$(uname -s)" = "Darwin" ]; then
     -framework ApplicationServices \
     -framework CoreFoundation \
     -framework IOKit
+  build_c_tool "$DOTFILES_DIR/scripts/vaultcrypt.c" "$TARGET_HOME/bin/vaultcrypt"
 else
   build_c_tool "$MINIFETCH_SOURCE" "$TARGET_HOME/bin/minifetch"
+  log "Skipping vaultcrypt: requires macOS CommonCrypto."
 fi
 build_c_tool "$DOTFILES_DIR/scripts/gitprompt.c" "$TARGET_HOME/bin/gitprompt"
 build_c_tool "$DOTFILES_DIR/scripts/ftree.c" "$TARGET_HOME/bin/ftree"

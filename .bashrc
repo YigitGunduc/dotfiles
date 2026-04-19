@@ -112,8 +112,26 @@ up() {
   cd "$path" || return
 }
 
+# jump to iCloud Drive
+icloud() {
+  cd "$HOME/Library/Mobile Documents/com~apple~CloudDocs" || return
+}
+
+# jump to Google Drive "My Drive" for the first configured account
+drive() {
+  local dir
+  for dir in "$HOME"/Library/CloudStorage/GoogleDrive-*/"My Drive"; do
+    [ -d "$dir" ] || continue
+    cd "$dir" || return
+    return
+  done
+  printf 'Google Drive path not found\n' >&2
+  return 1
+}
+
 prompt_update() {
   local prompt_path
+  local env_prompt=""
 
   prompt_path="$(short_path)"
   if command -v gitprompt >/dev/null 2>&1; then
@@ -122,10 +140,18 @@ prompt_update() {
     PROMPT_GIT=""
   fi
 
+  if [[ -n "${VIRTUAL_ENV_PROMPT:-}" ]]; then
+    env_prompt="${VIRTUAL_ENV_PROMPT} "
+  elif [[ -n "${VIRTUAL_ENV:-}" ]]; then
+    env_prompt="($(basename "${VIRTUAL_ENV}")) "
+  elif [[ -n "${CONDA_DEFAULT_ENV:-}" ]]; then
+    env_prompt="(${CONDA_DEFAULT_ENV}) "
+  fi
+
   if [[ "$color_prompt" == "yes" ]]; then
-    PS1="[\[\e[92m\]\u\[\e[m\]\[\e[94m\]\h\[\e[m\]:\[\e[93m\]${prompt_path}\[\e[m\]]\[\e[91m\]${PROMPT_GIT}\[\e[m\] \\$ "
+    PS1="\[\e[96m\]${env_prompt}\[\e[m\][\[\e[92m\]\u\[\e[m\]\[\e[94m\]\h\[\e[m\]:\[\e[93m\]${prompt_path}\[\e[m\]]\[\e[91m\]${PROMPT_GIT}\[\e[m\] \\$ "
   else
-    PS1="[\u@\h:${prompt_path}]${PROMPT_GIT} \\$ "
+    PS1="${env_prompt}[\u@\h:${prompt_path}]${PROMPT_GIT} \\$ "
   fi
 }
 
@@ -145,7 +171,6 @@ PROMPT_COMMAND='history -a; history -n; prompt_update'
 # Navigation
 alias ..='cd ..'
 alias ...='cd ../../../'
-alias icloud='cd ~/Library/Mobile\ Documents/com~apple~CloudDocs/'
 
 # Listing
 alias l='ls -lah'

@@ -35,10 +35,12 @@ Dry run:
   - `.gitconfig`
   - `.vim/vimrc`
   - `.vim/colors/gruvbox.vim`
-- Compiles to `~/bin`:
+- Installs to `~/bin`:
   - `minifetch`
   - `gitprompt`
   - `ftree`
+  - `vaultcrypt`
+  - `vim`
 
 If a target already exists, it gets backed up to `*.bak.<timestamp>`.
 
@@ -61,6 +63,44 @@ System/runtime assumptions:
 - `cc` to compile local C tools
 - Homebrew at `/opt/homebrew/bin/brew` or `/usr/local/bin/brew`
 - macOS `open` and Docker Desktop path are assumed in `.bash_profile`
+
+## Sensitive Files
+
+For encrypted local secrets, this repo ships `vaultcrypt`, a contained native
+binary built from a single C file with no Homebrew dependency.
+
+Properties:
+
+- macOS only
+- no Brew dependency
+- single source file: [scripts/vaultcrypt.c](/Users/anakin/.dotfiles/scripts/vaultcrypt.c)
+- file format is documented in the source header for recovery
+- algorithms are fixed:
+  - `PBKDF2-HMAC-SHA256`
+  - `AES-256-CTR`
+  - `HMAC-SHA256` over `header || ciphertext`
+
+Examples:
+
+```bash
+vaultcrypt enc -i wallet-seed.txt
+vaultcrypt dec -i wallet-seed.txt.vlt -o -
+vaultcrypt info -i wallet-seed.txt.vlt
+vaultcrypt info --json -i wallet-seed.txt.vlt
+vaultcrypt selftest
+```
+
+Practical rules:
+
+- Do not commit plaintext seed phrases to this repo
+- Keep the passphrase separate from the ciphertext
+- Test decryption immediately after creating a backup
+- Use `-o -` or `--stdout` explicitly if you want decrypted plaintext on stdout
+- Use `--recovery-json PATH` if you want a separate machine-readable recovery note
+
+Recovery note:
+- the ciphertext stores the salt, IV, and PBKDF2 iteration count
+- if you lose the tool, the source comment at the top of `vaultcrypt.c` describes the exact format and key split needed to decrypt with another implementation
 
 ## Shell
 
