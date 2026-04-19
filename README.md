@@ -96,10 +96,9 @@ Practical rules:
 - Keep the passphrase separate from the ciphertext
 - Test decryption immediately after creating a backup
 - Use `-o -` or `--stdout` explicitly if you want decrypted plaintext on stdout
-- Use `--recovery-json PATH` if you want a separate machine-readable recovery note
 
 Recovery note:
-- the ciphertext stores the salt, IV, and PBKDF2 iteration count
+- the ciphertext stores the recovery and algorithm metadata needed for `vaultcrypt info`
 - if you lose the tool, the source comment at the top of `vaultcrypt.c` describes the exact format and key split needed to decrypt with another implementation
 
 ## Shell
