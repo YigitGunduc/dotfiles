@@ -133,6 +133,70 @@ build_c_tool() {
   mv "$tmp_target" "$target"
 }
 
+ensure_python3() {
+  if ! command -v python3 >/dev/null 2>&1; then
+    printf 'Missing runtime: python3\n' >&2
+    exit 1
+  fi
+}
+
+install_python_app() {
+  local app_name=$1
+  local script_path=$2
+  local requirements_path=$3
+  local launcher_path=$4
+  local venv_dir="$TARGET_HOME/.local/share/dotfiles/venvs/$app_name"
+  local venv_python="$venv_dir/bin/python3"
+  local venv_pip="$venv_dir/bin/pip"
+  local parent tmp_launcher
+
+  ensure_python3
+
+  if [ ! -f "$script_path" ]; then
+    printf 'Missing Python script: %s\n' "$script_path" >&2
+    exit 1
+  fi
+
+  if [ ! -f "$requirements_path" ]; then
+    printf 'Missing requirements file: %s\n' "$requirements_path" >&2
+    exit 1
+  fi
+
+  ensure_dir "$venv_dir"
+  parent="$(dirname "$launcher_path")"
+  ensure_dir "$parent"
+
+  log "Provisioning Python app: $app_name"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    run_cmd python3 -m venv "$venv_dir"
+    run_cmd "$venv_python" -m pip install --upgrade pip
+    run_cmd "$venv_pip" install -r "$requirements_path"
+    log "Writing launcher: $launcher_path"
+    return
+  fi
+
+  python3 -m venv "$venv_dir"
+  "$venv_python" -m pip install --upgrade pip
+  "$venv_pip" install -r "$requirements_path"
+
+  chmod +x "$script_path"
+
+  if [ -L "$launcher_path" ] || [ -d "$launcher_path" ]; then
+    backup_path "$launcher_path"
+  elif [ -e "$launcher_path" ]; then
+    backup_path "$launcher_path"
+  fi
+
+  tmp_launcher="${launcher_path}.tmp.$$"
+  cat >"$tmp_launcher" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+exec "$venv_python" "$script_path" "\$@"
+EOF
+  chmod +x "$tmp_launcher"
+  mv "$tmp_launcher" "$launcher_path"
+}
+
 for arg in "$@"; do
   case "$arg" in
     --dry-run)
@@ -182,6 +246,12 @@ else
 fi
 build_c_tool "$DOTFILES_DIR/scripts/gitprompt.c" "$TARGET_HOME/bin/gitprompt"
 build_c_tool "$DOTFILES_DIR/scripts/ftree.c" "$TARGET_HOME/bin/ftree"
+build_c_tool "$DOTFILES_DIR/scripts/shamir.c" "$TARGET_HOME/bin/shamir"
+install_python_app \
+  "auther" \
+  "$DOTFILES_DIR/scripts/auther.py" \
+  "$DOTFILES_DIR/scripts/auther-requirements.txt" \
+  "$TARGET_HOME/bin/auther"
 link_path "$DOTFILES_DIR/scripts/vim" "$TARGET_HOME/bin/vim"
 
 log ""
