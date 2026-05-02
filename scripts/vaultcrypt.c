@@ -23,7 +23,7 @@
 /*
  * vaultcrypt
  *
- * Minimal VLTENC03 format (all integers big-endian):
+ * Minimal VLTENC03 format (legacy, all integers big-endian):
  *   magic[8]      = "VLTENC03"
  *   version[4]    = 3
  *   kdf_id[4]     = 1   (PBKDF2-HMAC-SHA256)
@@ -38,6 +38,25 @@
  *   ciphertext[n]
  *   tag[32]
  *
+ * Preferred VLTENC04 format (self-describing text header):
+ *   VLTENC04\n
+ *   version: 4\n
+ *   kdf_id: 1\n
+ *   kdf: PBKDF2-HMAC-SHA256\n
+ *   cipher_id: 1\n
+ *   cipher: AES-256-CTR\n
+ *   mac_id: 1\n
+ *   mac: HMAC-SHA256 (header || ciphertext)\n
+ *   iterations: <decimal>\n
+ *   salt_len: 32\n
+ *   iv_len: 16\n
+ *   reserved: 0\n
+ *   salt_hex: <64 hex chars>\n
+ *   iv_hex: <32 hex chars>\n
+ *   \n
+ *   ciphertext[n]
+ *   tag[32]
+ *
  * Key derivation:
  *   passphrase -> PBKDF2-HMAC-SHA256 -> 64 bytes
  *   first 32 bytes  = AES-256-CTR key
@@ -45,9 +64,11 @@
  */
 
 #define MAGIC_V3 "VLTENC03"
+#define MAGIC_V4 "VLTENC04"
 #define MAGIC_LEN 8u
 
 #define VERSION_V3 3u
+#define VERSION_V4 4u
 
 #define KDF_ID_PBKDF2_SHA256 1u
 #define CIPHER_ID_AES256_CTR 1u
@@ -61,6 +82,7 @@
 #define TAG_LEN 32u
 #define HEADER_RESERVED 0u
 #define V3_HEADER_LEN (MAGIC_LEN + (8u * 4u) + SALT_LEN + IV_LEN)
+#define MAX_HEADER_LEN 4096u
 #define DEFAULT_ITERATIONS 600000u
 #define MIN_ITERATIONS 100000u
 #define IO_CHUNK_SIZE 65536u
@@ -68,7 +90,8 @@
 
 typedef enum {
   FORMAT_UNKNOWN = 0,
-  FORMAT_V3 = 3
+  FORMAT_V3 = 3,
+  FORMAT_V4 = 4
 } VaultFormat;
 
 typedef struct {
@@ -89,7 +112,7 @@ typedef struct {
   uint32_t reserved;
   uint8_t salt[SALT_LEN];
   uint8_t iv[IV_LEN];
-} VaultHeaderV3;
+} VaultHeader;
 
 static void secure_bzero(void *ptr, size_t len) {
   volatile unsigned char *p = (volatile unsigned char *)ptr;
@@ -108,7 +131,8 @@ static void usage(FILE *stream, int exit_code) {
           "\n"
           "Notes:\n"
           "  - macOS only: uses built-in CommonCrypto.\n"
-          "  - enc writes VLTENC03 files.\n"
+          "  - enc writes VLTENC04 files with a readable text header.\n"
+          "  - dec and info read both VLTENC03 and VLTENC04 files.\n"
           "  - enc and dec use passphrase-derived AES-256-CTR + HMAC-SHA256.\n"
           "  - enc prompts twice for a passphrase.\n"
           "  - dec authenticates the full ciphertext before releasing plaintext.\n"
@@ -139,6 +163,129 @@ static uint32_t read_be32(const uint8_t *src) {
          ((uint32_t)src[1] << 16) |
          ((uint32_t)src[2] << 8) |
          (uint32_t)src[3];
+}
+
+static const char *kdf_name(uint32_t id) {
+  switch (id) {
+    case KDF_ID_PBKDF2_SHA256:
+      return "PBKDF2-HMAC-SHA256";
+    default:
+      return "unknown";
+  }
+}
+
+static const char *cipher_name(uint32_t id) {
+  switch (id) {
+    case CIPHER_ID_AES256_CTR:
+      return "AES-256-CTR";
+    default:
+      return "unknown";
+  }
+}
+
+static const char *mac_name(uint32_t id) {
+  switch (id) {
+    case MAC_ID_HMAC_SHA256_ETM:
+      return "HMAC-SHA256 (header || ciphertext)";
+    default:
+      return "unknown";
+  }
+}
+
+static void hex_encode(const uint8_t *src, size_t len, char *dst, size_t dst_len) {
+  static const char digits[] = "0123456789abcdef";
+  size_t i;
+
+  if (dst_len < (len * 2u) + 1u) {
+    fail_msg("hex buffer too small");
+  }
+
+  for (i = 0; i < len; ++i) {
+    dst[i * 2u] = digits[src[i] >> 4];
+    dst[i * 2u + 1u] = digits[src[i] & 0x0fu];
+  }
+  dst[len * 2u] = '\0';
+}
+
+static int hex_value(int ch) {
+  if (ch >= '0' && ch <= '9') {
+    return ch - '0';
+  }
+  if (ch >= 'a' && ch <= 'f') {
+    return 10 + (ch - 'a');
+  }
+  if (ch >= 'A' && ch <= 'F') {
+    return 10 + (ch - 'A');
+  }
+  return -1;
+}
+
+static void hex_decode_exact(const char *src, uint8_t *dst, size_t dst_len, const char *label) {
+  size_t i;
+
+  if (strlen(src) != dst_len * 2u) {
+    fail_msg(label);
+  }
+
+  for (i = 0; i < dst_len; ++i) {
+    int hi = hex_value((unsigned char)src[i * 2u]);
+    int lo = hex_value((unsigned char)src[i * 2u + 1u]);
+
+    if (hi < 0 || lo < 0) {
+      fail_msg(label);
+    }
+    dst[i] = (uint8_t)((hi << 4) | lo);
+  }
+}
+
+static uint32_t parse_u32_strict(const char *src, const char *label) {
+  char *end = NULL;
+  unsigned long parsed;
+
+  errno = 0;
+  parsed = strtoul(src, &end, 10);
+  if (errno != 0 || end == src || *end != '\0' || parsed > UINT32_MAX) {
+    fail_msg(label);
+  }
+  return (uint32_t)parsed;
+}
+
+static void print_hex_ascii_line(const uint8_t *src, size_t offset, size_t count) {
+  size_t i;
+
+  printf("%04zx: ", offset);
+  for (i = 0; i < 16u; ++i) {
+    if (i < count) {
+      printf("%02x ", src[i]);
+    } else {
+      printf("   ");
+    }
+  }
+
+  printf(" |");
+  for (i = 0; i < count; ++i) {
+    unsigned char ch = src[i];
+    if (ch >= 32u && ch <= 126u) {
+      putchar((int)ch);
+    } else {
+      putchar('.');
+    }
+  }
+  for (; i < 16u; ++i) {
+    putchar(' ');
+  }
+  printf("|\n");
+}
+
+static void print_header_dump(const uint8_t *src, size_t len) {
+  size_t offset = 0;
+
+  while (offset < len) {
+    size_t remaining = len - offset;
+    size_t count = remaining < 16u ? remaining : 16u;
+    print_hex_ascii_line(src + offset, offset, count);
+    offset += count;
+  }
 }
 
 static bool constant_time_eq(const uint8_t *a, const uint8_t *b, size_t len) {
@@ -338,8 +485,8 @@ static void derive_keys(const char *passphrase,
   secure_bzero(derived, sizeof(derived));
 }
 
-static void fill_header_v3(VaultHeaderV3 *hdr, uint32_t iterations) {
-  hdr->version = VERSION_V3;
+static void fill_header(VaultHeader *hdr, uint32_t iterations, uint32_t version) {
+  hdr->version = version;
   hdr->kdf_id = KDF_ID_PBKDF2_SHA256;
   hdr->cipher_id = CIPHER_ID_AES256_CTR;
   hdr->mac_id = MAC_ID_HMAC_SHA256_ETM;
@@ -351,7 +498,7 @@ static void fill_header_v3(VaultHeaderV3 *hdr, uint32_t iterations) {
   random_bytes(hdr->iv, sizeof(hdr->iv));
 }
 
-static void serialize_header_v3(const VaultHeaderV3 *hdr, uint8_t out[V3_HEADER_LEN]) {
+static void serialize_header_v3(const VaultHeader *hdr, uint8_t out[V3_HEADER_LEN]) {
   memcpy(out, MAGIC_V3, MAGIC_LEN);
   write_be32(out + 8, hdr->version);
   write_be32(out + 12, hdr->kdf_id);
@@ -365,14 +512,122 @@ static void serialize_header_v3(const VaultHeaderV3 *hdr, uint8_t out[V3_HEADER_
   memcpy(out + 72, hdr->iv, IV_LEN);
 }
 
+static uint8_t *serialize_header_v4(const VaultHeader *hdr, size_t *len_out) {
+  char salt_hex[(SALT_LEN * 2u) + 1u];
+  char iv_hex[(IV_LEN * 2u) + 1u];
+  int written;
+  size_t len;
+  uint8_t *out;
+
+  hex_encode(hdr->salt, sizeof(hdr->salt), salt_hex, sizeof(salt_hex));
+  hex_encode(hdr->iv, sizeof(hdr->iv), iv_hex, sizeof(iv_hex));
+  written = snprintf(NULL,
+                     0,
+                     MAGIC_V4 "\n"
+                     "version: %u\n"
+                     "kdf_id: %u\n"
+                     "kdf: %s\n"
+                     "cipher_id: %u\n"
+                     "cipher: %s\n"
+                     "mac_id: %u\n"
+                     "mac: %s\n"
+                     "iterations: %u\n"
+                     "salt_len: %u\n"
+                     "iv_len: %u\n"
+                     "reserved: %u\n"
+                     "salt_hex: %s\n"
+                     "iv_hex: %s\n"
+                     "\n",
+                     hdr->version,
+                     hdr->kdf_id,
+                     kdf_name(hdr->kdf_id),
+                     hdr->cipher_id,
+                     cipher_name(hdr->cipher_id),
+                     hdr->mac_id,
+                     mac_name(hdr->mac_id),
+                     hdr->iterations,
+                     hdr->salt_len,
+                     hdr->iv_len,
+                     hdr->reserved,
+                     salt_hex,
+                     iv_hex);
+  if (written < 0) {
+    fail_msg("failed to build VLTENC04 header");
+  }
+
+  len = (size_t)written;
+  out = (uint8_t *)malloc(len + 1u);
+  if (out == NULL) {
+    fail_msg("out of memory");
+  }
+
+  if (snprintf((char *)out,
+               len + 1u,
+               MAGIC_V4 "\n"
+               "version: %u\n"
+               "kdf_id: %u\n"
+               "kdf: %s\n"
+               "cipher_id: %u\n"
+               "cipher: %s\n"
+               "mac_id: %u\n"
+               "mac: %s\n"
+               "iterations: %u\n"
+               "salt_len: %u\n"
+               "iv_len: %u\n"
+               "reserved: %u\n"
+               "salt_hex: %s\n"
+               "iv_hex: %s\n"
+               "\n",
+               hdr->version,
+               hdr->kdf_id,
+               kdf_name(hdr->kdf_id),
+               hdr->cipher_id,
+               cipher_name(hdr->cipher_id),
+               hdr->mac_id,
+               mac_name(hdr->mac_id),
+               hdr->iterations,
+               hdr->salt_len,
+               hdr->iv_len,
+               hdr->reserved,
+               salt_hex,
+               iv_hex) != written) {
+    free(out);
+    fail_msg("failed to finalize VLTENC04 header");
+  }
+
+  *len_out = len;
+  return out;
+}
+
 static VaultFormat detect_format(const uint8_t magic[MAGIC_LEN]) {
   if (memcmp(magic, MAGIC_V3, MAGIC_LEN) == 0) {
     return FORMAT_V3;
   }
+  if (memcmp(magic, MAGIC_V4, MAGIC_LEN) == 0) {
+    return FORMAT_V4;
+  }
   return FORMAT_UNKNOWN;
 }
 
-static void parse_header_v3(const uint8_t in[V3_HEADER_LEN], VaultHeaderV3 *hdr) {
+static void validate_header_common(const VaultHeader *hdr) {
+  if ((hdr->version != VERSION_V3 && hdr->version != VERSION_V4) ||
+      hdr->kdf_id != KDF_ID_PBKDF2_SHA256 ||
+      hdr->cipher_id != CIPHER_ID_AES256_CTR ||
+      hdr->mac_id != MAC_ID_HMAC_SHA256_ETM) {
+    fail_msg("unsupported vaultcrypt parameters");
+  }
+  if (hdr->salt_len != SALT_LEN || hdr->iv_len != IV_LEN) {
+    fail_msg("unsupported salt or IV size in vaultcrypt header");
+  }
+  if (hdr->reserved != HEADER_RESERVED) {
+    fail_msg("unsupported vaultcrypt header flags");
+  }
+  if (hdr->iterations < MIN_ITERATIONS) {
+    fail_msg("stored PBKDF2 iteration count is below the supported minimum");
+  }
+}
+
+static void parse_header_v3(const uint8_t in[V3_HEADER_LEN], VaultHeader *hdr) {
   if (detect_format(in) != FORMAT_V3) {
     fail_msg("file does not start with a VLTENC03 header");
   }
@@ -388,21 +643,165 @@ static void parse_header_v3(const uint8_t in[V3_HEADER_LEN], VaultHeaderV3 *hdr)
   memcpy(hdr->salt, in + 40, SALT_LEN);
   memcpy(hdr->iv, in + 72, IV_LEN);
 
-  if (hdr->version != VERSION_V3 ||
-      hdr->kdf_id != KDF_ID_PBKDF2_SHA256 ||
-      hdr->cipher_id != CIPHER_ID_AES256_CTR ||
-      hdr->mac_id != MAC_ID_HMAC_SHA256_ETM) {
-    fail_msg("unsupported VLTENC03 parameters");
+  validate_header_common(hdr);
+}
+
+static void parse_header_v4(const uint8_t *in, size_t len, VaultHeader *hdr) {
+  char *copy;
+  char *cursor;
+  int saw_blank = 0;
+  int saw_version = 0;
+  int saw_kdf_id = 0;
+  int saw_cipher_id = 0;
+  int saw_mac_id = 0;
+  int saw_iterations = 0;
+  int saw_salt_len = 0;
+  int saw_iv_len = 0;
+  int saw_reserved = 0;
+  int saw_salt_hex = 0;
+  int saw_iv_hex = 0;
+
+  if (len < MAGIC_LEN + 2u || detect_format(in) != FORMAT_V4) {
+    fail_msg("file does not start with a VLTENC04 header");
   }
-  if (hdr->salt_len != SALT_LEN || hdr->iv_len != IV_LEN) {
-    fail_msg("unsupported salt or IV size in VLTENC03 header");
+  if (in[len - 1u] != '\n' || in[len - 2u] != '\n') {
+    fail_msg("unterminated VLTENC04 header");
   }
-  if (hdr->reserved != HEADER_RESERVED) {
-    fail_msg("unsupported VLTENC03 header flags");
+
+  memset(hdr, 0, sizeof(*hdr));
+  copy = (char *)malloc(len + 1u);
+  if (copy == NULL) {
+    fail_msg("out of memory");
   }
-  if (hdr->iterations < MIN_ITERATIONS) {
-    fail_msg("stored PBKDF2 iteration count is below the supported minimum");
+  memcpy(copy, in, len);
+  copy[len] = '\0';
+
+  cursor = copy;
+  {
+    char *nl = strchr(cursor, '\n');
+    if (nl == NULL) {
+      free(copy);
+      fail_msg("invalid VLTENC04 header");
+    }
+    *nl = '\0';
+    if (strcmp(cursor, MAGIC_V4) != 0) {
+      free(copy);
+      fail_msg("invalid VLTENC04 magic");
+    }
+    cursor = nl + 1;
   }
+
+  while (*cursor != '\0') {
+    char *line = cursor;
+    char *nl = strchr(line, '\n');
+    if (nl == NULL) {
+      free(copy);
+      fail_msg("unterminated VLTENC04 header line");
+    }
+    *nl = '\0';
+    cursor = nl + 1;
+
+    char *sep;
+    const char *value;
+
+    if (*line == '\0') {
+      saw_blank = 1;
+      break;
+    }
+
+    sep = strstr(line, ": ");
+    if (sep == NULL) {
+      free(copy);
+      fail_msg("malformed VLTENC04 header line");
+    }
+    *sep = '\0';
+    value = sep + 2;
+
+    if (strcmp(line, "version") == 0) {
+      hdr->version = parse_u32_strict(value, "invalid version in VLTENC04 header");
+      saw_version = 1;
+    } else if (strcmp(line, "kdf_id") == 0) {
+      hdr->kdf_id = parse_u32_strict(value, "invalid kdf_id in VLTENC04 header");
+      saw_kdf_id = 1;
+    } else if (strcmp(line, "cipher_id") == 0) {
+      hdr->cipher_id = parse_u32_strict(value, "invalid cipher_id in VLTENC04 header");
+      saw_cipher_id = 1;
+    } else if (strcmp(line, "mac_id") == 0) {
+      hdr->mac_id = parse_u32_strict(value, "invalid mac_id in VLTENC04 header");
+      saw_mac_id = 1;
+    } else if (strcmp(line, "iterations") == 0) {
+      hdr->iterations = parse_u32_strict(value, "invalid iterations in VLTENC04 header");
+      saw_iterations = 1;
+    } else if (strcmp(line, "salt_len") == 0) {
+      hdr->salt_len = parse_u32_strict(value, "invalid salt_len in VLTENC04 header");
+      saw_salt_len = 1;
+    } else if (strcmp(line, "iv_len") == 0) {
+      hdr->iv_len = parse_u32_strict(value, "invalid iv_len in VLTENC04 header");
+      saw_iv_len = 1;
+    } else if (strcmp(line, "reserved") == 0) {
+      hdr->reserved = parse_u32_strict(value, "invalid reserved in VLTENC04 header");
+      saw_reserved = 1;
+    } else if (strcmp(line, "salt_hex") == 0) {
+      hex_decode_exact(value, hdr->salt, sizeof(hdr->salt), "invalid salt_hex in VLTENC04 header");
+      saw_salt_hex = 1;
+    } else if (strcmp(line, "iv_hex") == 0) {
+      hex_decode_exact(value, hdr->iv, sizeof(hdr->iv), "invalid iv_hex in VLTENC04 header");
+      saw_iv_hex = 1;
+    }
+  }
+
+  free(copy);
+
+  if (!saw_blank ||
+      !saw_version ||
+      !saw_kdf_id ||
+      !saw_cipher_id ||
+      !saw_mac_id ||
+      !saw_iterations ||
+      !saw_salt_len ||
+      !saw_iv_len ||
+      !saw_reserved ||
+      !saw_salt_hex ||
+      !saw_iv_hex) {
+    fail_msg("incomplete VLTENC04 header");
+  }
+
+  validate_header_common(hdr);
+}
+
+static uint8_t *read_header_v4(FILE *fp, const uint8_t magic[MAGIC_LEN], size_t *header_len_out) {
+  uint8_t *buf;
+  size_t len = MAGIC_LEN;
+  int prev = 0;
+  int ch;
+
+  buf = (uint8_t *)malloc(MAX_HEADER_LEN);
+  if (buf == NULL) {
+    fail_msg("out of memory");
+  }
+  memcpy(buf, magic, MAGIC_LEN);
+
+  while (len < MAX_HEADER_LEN) {
+    ch = fgetc(fp);
+    if (ch == EOF) {
+      free(buf);
+      if (ferror(fp)) {
+        fail_errno("read header");
+      }
+      fail_msg("unexpected end of file in VLTENC04 header");
+    }
+
+    buf[len++] = (uint8_t)ch;
+    if (prev == '\n' && ch == '\n') {
+      *header_len_out = len;
+      return buf;
+    }
+    prev = ch;
+  }
+
+  free(buf);
+  fail_msg("VLTENC04 header is too large");
+  return NULL;
 }
 
 static char *prompt_passphrase(const char *prompt, int confirm, int require_tty) {
@@ -505,7 +904,8 @@ static void seek_to_offset(FILE *fp, off_t offset, const char *label) {
 
 static void authenticate_ciphertext(FILE *in,
                                     uint64_t ciphertext_len,
-                                    const uint8_t header_bytes[V3_HEADER_LEN],
+                                    const uint8_t *header_bytes,
+                                    size_t header_len,
                                     const uint8_t mac_key[MAC_KEY_LEN]) {
   uint8_t inbuf[IO_CHUNK_SIZE];
   uint8_t expected_tag[TAG_LEN];
@@ -515,7 +915,7 @@ static void authenticate_ciphertext(FILE *in,
 
   memset(actual_tag, 0, sizeof(actual_tag));
   CCHmacInit(&hmac, kCCHmacAlgSHA256, mac_key, MAC_KEY_LEN);
-  CCHmacUpdate(&hmac, header_bytes, V3_HEADER_LEN);
+  CCHmacUpdate(&hmac, header_bytes, header_len);
 
   while (remaining > 0u) {
     size_t want = remaining > sizeof(inbuf) ? sizeof(inbuf) : (size_t)remaining;
@@ -593,13 +993,14 @@ static void encrypt_command(const char *input_path,
   char *temp_path = NULL;
   char *owned_output = NULL;
   char *passphrase = NULL;
-  uint8_t header_bytes[V3_HEADER_LEN];
+  uint8_t *header_bytes = NULL;
+  size_t header_len = 0;
   uint8_t enc_key[ENC_KEY_LEN];
   uint8_t mac_key[MAC_KEY_LEN];
   uint8_t inbuf[IO_CHUNK_SIZE];
   uint8_t outbuf[IO_CHUNK_SIZE + 32u];
   uint8_t tag[TAG_LEN];
-  VaultHeaderV3 hdr;
+  VaultHeader hdr;
   CCHmacContext hmac;
   CCCryptorRef cryptor;
 
@@ -629,8 +1030,8 @@ static void encrypt_command(const char *input_path,
   }
 
   passphrase = prompt_passphrase("Passphrase: ", 1, opts->require_tty);
-  fill_header_v3(&hdr, iterations);
-  serialize_header_v3(&hdr, header_bytes);
+  fill_header(&hdr, iterations, VERSION_V4);
+  header_bytes = serialize_header_v4(&hdr, &header_len);
   derive_keys(passphrase, hdr.salt, hdr.iterations, enc_key, mac_key);
   lock_memory_best_effort(enc_key, sizeof(enc_key));
   lock_memory_best_effort(mac_key, sizeof(mac_key));
@@ -642,9 +1043,9 @@ static void encrypt_command(const char *input_path,
   }
   out = open_output_temp(output_path, &temp_path, opts->force);
 
-  write_exact(out, header_bytes, sizeof(header_bytes), "write header");
+  write_exact(out, header_bytes, header_len, "write header");
   CCHmacInit(&hmac, kCCHmacAlgSHA256, mac_key, sizeof(mac_key));
-  CCHmacUpdate(&hmac, header_bytes, sizeof(header_bytes));
+  CCHmacUpdate(&hmac, header_bytes, header_len);
 
   cryptor = create_ctr_cryptor(kCCEncrypt, enc_key, hdr.iv);
   for (;;) {
@@ -693,6 +1094,7 @@ static void encrypt_command(const char *input_path,
   if (in != NULL && in != stdin) {
     fclose(in);
   }
+  free(header_bytes);
   secure_release_buffer(enc_key, sizeof(enc_key));
   secure_release_buffer(mac_key, sizeof(mac_key));
   secure_free_string(&passphrase);
@@ -704,11 +1106,14 @@ static void decrypt_command(const char *input_path, const char *output_path, con
   FILE *out;
   char *temp_path = NULL;
   uint8_t magic[MAGIC_LEN];
-  uint8_t header_bytes[V3_HEADER_LEN];
+  uint8_t header_v3[V3_HEADER_LEN];
+  uint8_t *header_bytes = NULL;
+  size_t header_len = 0;
   uint8_t enc_key[ENC_KEY_LEN];
   uint8_t mac_key[MAC_KEY_LEN];
   char *passphrase = NULL;
-  VaultHeaderV3 hdr;
+  VaultFormat format;
+  VaultHeader hdr;
   uint64_t total_size;
   uint64_t ciphertext_len;
 
@@ -731,29 +1136,44 @@ static void decrypt_command(const char *input_path, const char *output_path, con
   }
 
   total_size = input_file_size(input_path);
-  if (total_size < V3_HEADER_LEN + TAG_LEN) {
+  if (total_size < MAGIC_LEN + TAG_LEN) {
     fail_msg("file is too small to be a vaultcrypt ciphertext");
   }
-  ciphertext_len = total_size - V3_HEADER_LEN - TAG_LEN;
 
   in = open_input_file(input_path);
   read_exact(in, magic, sizeof(magic), "read magic");
-  if (detect_format(magic) != FORMAT_V3) {
+  format = detect_format(magic);
+  if (format == FORMAT_UNKNOWN) {
     fclose(in);
     fail_msg("unsupported vaultcrypt file format");
   }
 
-  memcpy(header_bytes, magic, MAGIC_LEN);
-  read_exact(in, header_bytes + MAGIC_LEN, V3_HEADER_LEN - MAGIC_LEN, "read header");
-  parse_header_v3(header_bytes, &hdr);
+  if (format == FORMAT_V3) {
+    memcpy(header_v3, magic, MAGIC_LEN);
+    read_exact(in, header_v3 + MAGIC_LEN, V3_HEADER_LEN - MAGIC_LEN, "read header");
+    parse_header_v3(header_v3, &hdr);
+    header_bytes = header_v3;
+    header_len = V3_HEADER_LEN;
+  } else {
+    header_bytes = read_header_v4(in, magic, &header_len);
+    parse_header_v4(header_bytes, header_len, &hdr);
+  }
+  if (total_size < header_len + TAG_LEN) {
+    if (format == FORMAT_V4) {
+      free(header_bytes);
+    }
+    fclose(in);
+    fail_msg("file is too small to be a vaultcrypt ciphertext");
+  }
+  ciphertext_len = total_size - header_len - TAG_LEN;
 
   passphrase = prompt_passphrase("Passphrase: ", 0, opts->require_tty);
   derive_keys(passphrase, hdr.salt, hdr.iterations, enc_key, mac_key);
   lock_memory_best_effort(enc_key, sizeof(enc_key));
   lock_memory_best_effort(mac_key, sizeof(mac_key));
 
-  authenticate_ciphertext(in, ciphertext_len, header_bytes, mac_key);
-  seek_to_offset(in, (off_t)V3_HEADER_LEN, "seek ciphertext");
+  authenticate_ciphertext(in, ciphertext_len, header_bytes, header_len, mac_key);
+  seek_to_offset(in, (off_t)header_len, "seek ciphertext");
 
   if (strcmp(output_path, "-") == 0) {
     out = tmpfile();
@@ -785,6 +1205,9 @@ static void decrypt_command(const char *input_path, const char *output_path, con
     fclose(out);
   }
 
+  if (format == FORMAT_V4) {
+    free(header_bytes);
+  }
   secure_release_buffer(enc_key, sizeof(enc_key));
   secure_release_buffer(mac_key, sizeof(mac_key));
   secure_free_string(&passphrase);
@@ -792,51 +1215,128 @@ static void decrypt_command(const char *input_path, const char *output_path, con
 
 static void info_command(const char *input_path, const Options *opts) {
   FILE *in;
-  uint8_t header_bytes[V3_HEADER_LEN];
-  VaultHeaderV3 hdr;
+  uint8_t magic[MAGIC_LEN];
+  uint8_t header_v3[V3_HEADER_LEN];
+  uint8_t *header_bytes = NULL;
+  size_t header_len = 0;
+  VaultFormat format;
+  char *header_hex = NULL;
+  char salt_hex[(SALT_LEN * 2u) + 1u];
+  char iv_hex[(IV_LEN * 2u) + 1u];
+  VaultHeader hdr;
 
   if (input_path == NULL || strcmp(input_path, "-") == 0) {
     fail_msg("info requires a regular input file");
   }
 
   in = open_input_file(input_path);
-  read_exact(in, header_bytes, sizeof(header_bytes), "read header");
+  read_exact(in, magic, sizeof(magic), "read magic");
   fclose(in);
-  parse_header_v3(header_bytes, &hdr);
+  format = detect_format(magic);
+  in = open_input_file(input_path);
+  if (format == FORMAT_V3) {
+    read_exact(in, header_v3, sizeof(header_v3), "read header");
+    header_bytes = header_v3;
+    header_len = V3_HEADER_LEN;
+    parse_header_v3(header_bytes, &hdr);
+  } else if (format == FORMAT_V4) {
+    read_exact(in, magic, sizeof(magic), "read magic");
+    header_bytes = read_header_v4(in, magic, &header_len);
+    parse_header_v4(header_bytes, header_len, &hdr);
+  } else {
+    fclose(in);
+    fail_msg("unsupported vaultcrypt file format");
+  }
+  fclose(in);
+  header_hex = (char *)malloc((header_len * 2u) + 1u);
+  if (header_hex == NULL) {
+    if (format == FORMAT_V4) {
+      free(header_bytes);
+    }
+    fail_msg("out of memory");
+  }
+  hex_encode(header_bytes, header_len, header_hex, (header_len * 2u) + 1u);
+  hex_encode(hdr.salt, sizeof(hdr.salt), salt_hex, sizeof(salt_hex));
+  hex_encode(hdr.iv, sizeof(hdr.iv), iv_hex, sizeof(iv_hex));
 
   if (opts->info_json) {
     printf("{\n"
            "  \"file\": \"%s\",\n"
-           "  \"format\": \"VLTENC03\",\n"
-           "  \"kdf\": \"PBKDF2-HMAC-SHA256\",\n"
-           "  \"cipher\": \"AES-256-CTR\",\n"
-           "  \"mac\": \"HMAC-SHA256 (header || ciphertext)\",\n"
+           "  \"format\": \"%s\",\n"
+           "  \"header_len\": %zu,\n"
+           "  \"version\": %u,\n"
+           "  \"kdf_id\": %u,\n"
+           "  \"kdf\": \"%s\",\n"
+           "  \"cipher_id\": %u,\n"
+           "  \"cipher\": \"%s\",\n"
+           "  \"mac_id\": %u,\n"
+           "  \"mac\": \"%s\",\n"
            "  \"iterations\": %u,\n"
            "  \"salt_len\": %u,\n"
-           "  \"iv_len\": %u\n"
+           "  \"iv_len\": %u,\n"
+           "  \"reserved\": %u,\n"
+           "  \"salt_hex\": \"%s\",\n"
+           "  \"iv_hex\": \"%s\",\n"
+           "  \"header_hex\": \"%s\"\n"
            "}\n",
            input_path,
+           format == FORMAT_V4 ? MAGIC_V4 : MAGIC_V3,
+           header_len,
+           hdr.version,
+           hdr.kdf_id,
+           kdf_name(hdr.kdf_id),
+           hdr.cipher_id,
+           cipher_name(hdr.cipher_id),
+           hdr.mac_id,
+           mac_name(hdr.mac_id),
            hdr.iterations,
            hdr.salt_len,
-           hdr.iv_len);
+           hdr.iv_len,
+           hdr.reserved,
+           salt_hex,
+           iv_hex,
+           header_hex);
+    if (format == FORMAT_V4) {
+      free(header_bytes);
+    }
+    free(header_hex);
     return;
   }
 
   printf("file: %s\n", input_path);
-  printf("format: VLTENC03\n");
-  printf("kdf: PBKDF2-HMAC-SHA256\n");
-  printf("cipher: AES-256-CTR\n");
-  printf("mac: HMAC-SHA256 (header || ciphertext)\n");
+  printf("format: %s\n", format == FORMAT_V4 ? MAGIC_V4 : MAGIC_V3);
+  printf("header_len: %zu\n", header_len);
+  printf("magic_ascii: %.8s\n", header_bytes);
+  printf("version: %u\n", hdr.version);
+  printf("kdf_id: %u\n", hdr.kdf_id);
+  printf("kdf: %s\n", kdf_name(hdr.kdf_id));
+  printf("cipher_id: %u\n", hdr.cipher_id);
+  printf("cipher: %s\n", cipher_name(hdr.cipher_id));
+  printf("mac_id: %u\n", hdr.mac_id);
+  printf("mac: %s\n", mac_name(hdr.mac_id));
   printf("iterations: %u\n", hdr.iterations);
   printf("salt_len: %u\n", hdr.salt_len);
   printf("iv_len: %u\n", hdr.iv_len);
+  printf("reserved: %u\n", hdr.reserved);
+  printf("salt_hex: %s\n", salt_hex);
+  printf("iv_hex: %s\n", iv_hex);
+  printf("header_hex: %s\n", header_hex);
+  printf("header_dump:\n");
+  print_header_dump(header_bytes, header_len);
+  if (format == FORMAT_V4) {
+    free(header_bytes);
+  }
+  free(header_hex);
 }
 
 static void selftest_v3(void) {
   static const char plaintext[] = "vaultcrypt minimal v3 self-test payload\n";
   static const char passphrase[] = "correct horse battery staple selftest";
-  VaultHeaderV3 hdr;
-  uint8_t header_bytes[V3_HEADER_LEN];
+  VaultHeader hdr;
+  VaultHeader legacy_hdr;
+  uint8_t legacy_header[V3_HEADER_LEN];
+  uint8_t *header_bytes = NULL;
+  size_t header_len = 0;
   uint8_t enc_key[ENC_KEY_LEN];
   uint8_t mac_key[MAC_KEY_LEN];
   uint8_t wrong_enc_key[ENC_KEY_LEN];
@@ -856,8 +1356,8 @@ static void selftest_v3(void) {
   memset(ciphertext, 0, sizeof(ciphertext));
   memset(decrypted, 0, sizeof(decrypted));
 
-  fill_header_v3(&hdr, DEFAULT_ITERATIONS);
-  serialize_header_v3(&hdr, header_bytes);
+  fill_header(&hdr, DEFAULT_ITERATIONS, VERSION_V4);
+  header_bytes = serialize_header_v4(&hdr, &header_len);
   derive_keys(passphrase, hdr.salt, hdr.iterations, enc_key, mac_key);
 
   cryptor = create_ctr_cryptor(kCCEncrypt, enc_key, hdr.iv);
@@ -874,12 +1374,12 @@ static void selftest_v3(void) {
   CCCryptorRelease(cryptor);
 
   CCHmacInit(&hmac, kCCHmacAlgSHA256, mac_key, sizeof(mac_key));
-  CCHmacUpdate(&hmac, header_bytes, sizeof(header_bytes));
+  CCHmacUpdate(&hmac, header_bytes, header_len);
   CCHmacUpdate(&hmac, ciphertext, sizeof(plaintext));
   CCHmacFinal(&hmac, tag);
 
   CCHmacInit(&hmac, kCCHmacAlgSHA256, mac_key, sizeof(mac_key));
-  CCHmacUpdate(&hmac, header_bytes, sizeof(header_bytes));
+  CCHmacUpdate(&hmac, header_bytes, header_len);
   CCHmacUpdate(&hmac, ciphertext, sizeof(plaintext));
   CCHmacFinal(&hmac, actual_tag);
   if (!constant_time_eq(tag, actual_tag, sizeof(tag))) {
@@ -902,9 +1402,13 @@ static void selftest_v3(void) {
     fail_msg("selftest round-trip mismatch");
   }
 
+  fill_header(&legacy_hdr, DEFAULT_ITERATIONS, VERSION_V3);
+  serialize_header_v3(&legacy_hdr, legacy_header);
+  parse_header_v3(legacy_header, &legacy_hdr);
+
   derive_keys("wrong password", hdr.salt, hdr.iterations, wrong_enc_key, wrong_mac_key);
   CCHmacInit(&hmac, kCCHmacAlgSHA256, wrong_mac_key, sizeof(wrong_mac_key));
-  CCHmacUpdate(&hmac, header_bytes, sizeof(header_bytes));
+  CCHmacUpdate(&hmac, header_bytes, header_len);
   CCHmacUpdate(&hmac, ciphertext, sizeof(plaintext));
   CCHmacFinal(&hmac, actual_tag);
   if (constant_time_eq(tag, actual_tag, sizeof(tag))) {
@@ -913,7 +1417,7 @@ static void selftest_v3(void) {
 
   ciphertext[0] ^= 0x01u;
   CCHmacInit(&hmac, kCCHmacAlgSHA256, mac_key, sizeof(mac_key));
-  CCHmacUpdate(&hmac, header_bytes, sizeof(header_bytes));
+  CCHmacUpdate(&hmac, header_bytes, header_len);
   CCHmacUpdate(&hmac, ciphertext, sizeof(plaintext));
   CCHmacFinal(&hmac, actual_tag);
   ciphertext[0] ^= 0x01u;
@@ -925,6 +1429,7 @@ static void selftest_v3(void) {
   secure_release_buffer(mac_key, sizeof(mac_key));
   secure_release_buffer(wrong_enc_key, sizeof(wrong_enc_key));
   secure_release_buffer(wrong_mac_key, sizeof(wrong_mac_key));
+  free(header_bytes);
 }
 
 static void selftest_command(void) {
