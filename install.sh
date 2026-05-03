@@ -24,6 +24,11 @@ log() {
   printf '%s\n' "$*"
 }
 
+section() {
+  log ""
+  log "== $* =="
+}
+
 run_cmd() {
   if [ "$DRY_RUN" -eq 1 ]; then
     printf '[dry-run] '
@@ -117,10 +122,6 @@ build_c_tool() {
     exit 1
   fi
 
-  if [ -L "$target" ] || [ -d "$target" ]; then
-    backup_path "$target"
-  fi
-
   log "Compiling: $target <- $source"
   if [ "$DRY_RUN" -eq 1 ]; then
     run_cmd cc -O2 -Wall -Wextra -pedantic -std=c11 "$source" "$@" -o "$target"
@@ -129,6 +130,41 @@ build_c_tool() {
 
   tmp_target="${target}.tmp.$$"
   cc -O2 -Wall -Wextra -pedantic -std=c11 "$source" "$@" -o "$tmp_target"
+  chmod +x "$tmp_target"
+  mv "$tmp_target" "$target"
+}
+
+install_built_binary() {
+  local build_script=$1
+  local built_binary=$2
+  local target=$3
+  local parent tmp_target
+
+  parent="$(dirname "$target")"
+  ensure_dir "$parent"
+
+  if [ ! -f "$build_script" ]; then
+    printf 'Missing build script: %s\n' "$build_script" >&2
+    exit 1
+  fi
+
+  log "Building and installing: $target via $build_script"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    run_cmd "$build_script"
+    run_cmd cp "$built_binary" "$target"
+    run_cmd chmod +x "$target"
+    return
+  fi
+
+  "$build_script"
+
+  if [ ! -f "$built_binary" ]; then
+    printf 'Missing built binary after build: %s\n' "$built_binary" >&2
+    exit 1
+  fi
+
+  tmp_target="${target}.tmp.$$"
+  cp "$built_binary" "$tmp_target"
   chmod +x "$tmp_target"
   mv "$tmp_target" "$target"
 }
@@ -181,12 +217,6 @@ install_python_app() {
 
   chmod +x "$script_path"
 
-  if [ -L "$launcher_path" ] || [ -d "$launcher_path" ]; then
-    backup_path "$launcher_path"
-  elif [ -e "$launcher_path" ]; then
-    backup_path "$launcher_path"
-  fi
-
   tmp_launcher="${launcher_path}.tmp.$$"
   cat >"$tmp_launcher" <<EOF
 #!/usr/bin/env bash
@@ -195,6 +225,53 @@ exec "$venv_python" "$script_path" "\$@"
 EOF
   chmod +x "$tmp_launcher"
   mv "$tmp_launcher" "$launcher_path"
+}
+
+render_template() {
+  local template_path=$1
+  local output_path=$2
+  shift 2
+  local parent tmp_output template_content pair key value
+
+  if [ ! -f "$template_path" ]; then
+    printf 'Missing template file: %s\n' "$template_path" >&2
+    exit 1
+  fi
+
+  parent="$(dirname "$output_path")"
+  ensure_dir "$parent"
+
+  if [ "$DRY_RUN" -eq 1 ]; then
+    log "Rendering template: $output_path <- $template_path"
+    return
+  fi
+
+  template_content="$(cat "$template_path")"
+  for pair in "$@"; do
+    key=${pair%%=*}
+    value=${pair#*=}
+    template_content="${template_content//${key}/${value}}"
+  done
+
+  tmp_output="${output_path}.tmp.$$"
+  printf '%s\n' "$template_content" >"$tmp_output"
+  mv "$tmp_output" "$output_path"
+}
+
+install_launch_agent() {
+  local template_path=$1
+  local rendered_path=$2
+  local linked_path=$3
+  local script_path=$4
+  local log_path=$5
+
+  render_template \
+    "$template_path" \
+    "$rendered_path" \
+    "__SCRIPT_PATH__=$script_path" \
+    "__LOG_PATH__=$log_path"
+
+  link_path "$rendered_path" "$linked_path"
 }
 
 for arg in "$@"; do
@@ -217,15 +294,25 @@ for arg in "$@"; do
   esac
 done
 
+section "Install"
 log "Dotfiles source: $DOTFILES_DIR"
 log "Target home:     $TARGET_HOME"
 
 ensure_homebrew_packages
 
+section "Directories"
 ensure_dir "$TARGET_HOME/bin"
 
 MINIFETCH_SOURCE="$DOTFILES_DIR/scripts/minifetch.c"
+VAULTCRYPT_DIR="$DOTFILES_DIR/scripts/vaultcrypt"
+AUTHER_DIR="$DOTFILES_DIR/scripts/auther"
+LAUNCHD_DIR="$DOTFILES_DIR/launchd"
+LAUNCH_AGENT_TEMPLATE="$LAUNCHD_DIR/com.dotfiles.icloud-documents-backup.plist.tmpl"
+LAUNCH_AGENT_RENDERED="$TARGET_HOME/.local/share/dotfiles/launchagents/com.dotfiles.icloud-documents-backup.plist"
+LAUNCH_AGENT_LINK="$TARGET_HOME/Library/LaunchAgents/com.dotfiles.icloud-documents-backup.plist"
+LAUNCH_AGENT_LOG="$TARGET_HOME/Library/Logs/icloud_backup_launchd.log"
 
+section "Links"
 link_path "$DOTFILES_DIR/.bashrc" "$TARGET_HOME/.bashrc"
 link_path "$DOTFILES_DIR/.bash_profile" "$TARGET_HOME/.bash_profile"
 link_path "$DOTFILES_DIR/.gitconfig" "$TARGET_HOME/.gitconfig"
@@ -234,12 +321,17 @@ if [ -L "$TARGET_HOME/.vimrc" ] || [ -e "$TARGET_HOME/.vimrc" ]; then
 fi
 link_path "$DOTFILES_DIR/.vim/vimrc" "$TARGET_HOME/.vim/vimrc"
 link_path "$DOTFILES_DIR/.vim/colors/gruvbox.vim" "$TARGET_HOME/.vim/colors/gruvbox.vim"
+
+section "Builds"
 if [ "$(uname -s)" = "Darwin" ]; then
   build_c_tool "$MINIFETCH_SOURCE" "$TARGET_HOME/bin/minifetch" \
     -framework ApplicationServices \
     -framework CoreFoundation \
     -framework IOKit
-  build_c_tool "$DOTFILES_DIR/scripts/vaultcrypt.c" "$TARGET_HOME/bin/vaultcrypt"
+  install_built_binary \
+    "$VAULTCRYPT_DIR/build-vaultcrypt.sh" \
+    "$VAULTCRYPT_DIR/vaultcrypt" \
+    "$TARGET_HOME/bin/vaultcrypt"
 else
   build_c_tool "$MINIFETCH_SOURCE" "$TARGET_HOME/bin/minifetch"
   log "Skipping vaultcrypt: requires macOS CommonCrypto."
@@ -249,11 +341,34 @@ build_c_tool "$DOTFILES_DIR/scripts/ftree.c" "$TARGET_HOME/bin/ftree"
 build_c_tool "$DOTFILES_DIR/scripts/shamir.c" "$TARGET_HOME/bin/shamir"
 install_python_app \
   "auther" \
-  "$DOTFILES_DIR/scripts/auther.py" \
-  "$DOTFILES_DIR/scripts/auther-requirements.txt" \
+  "$AUTHER_DIR/auther.py" \
+  "$AUTHER_DIR/requirements.txt" \
   "$TARGET_HOME/bin/auther"
 link_path "$DOTFILES_DIR/scripts/vim" "$TARGET_HOME/bin/vim"
 
-log ""
+section "Launch Agent"
+install_launch_agent \
+  "$LAUNCH_AGENT_TEMPLATE" \
+  "$LAUNCH_AGENT_RENDERED" \
+  "$LAUNCH_AGENT_LINK" \
+  "$DOTFILES_DIR/scripts/backup.sh" \
+  "$LAUNCH_AGENT_LOG"
+
+section "Done"
 log "Install complete."
 log "Open a new shell or run: source ~/.bash_profile"
+log ""
+log "iCloud Documents backup launch agent:"
+log "  Plist: $LAUNCH_AGENT_LINK"
+log "  Script: $DOTFILES_DIR/scripts/backup.sh"
+log "  Log:    $LAUNCH_AGENT_LOG"
+log ""
+log "Enable it:"
+log "  launchctl bootstrap gui/$(id -u) \"$LAUNCH_AGENT_LINK\""
+log ""
+log "Reload it after changes:"
+log "  launchctl bootout gui/$(id -u) \"$LAUNCH_AGENT_LINK\""
+log "  launchctl bootstrap gui/$(id -u) \"$LAUNCH_AGENT_LINK\""
+log ""
+log "Run it immediately for a test:"
+log "  launchctl kickstart -k gui/$(id -u)/com.dotfiles.icloud-documents-backup"
