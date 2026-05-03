@@ -73,7 +73,7 @@ Properties:
 
 - macOS only
 - no Brew dependency
-- single source file: [scripts/vaultcrypt.c](/Users/anakin/.dotfiles/scripts/vaultcrypt.c)
+- single source file: [scripts/vaultcrypt/vaultcrypt.c](/Users/anakin/.dotfiles/scripts/vaultcrypt/vaultcrypt.c)
 - file format is documented in the source header for recovery
 - algorithms are fixed:
   - `PBKDF2-HMAC-SHA256`
@@ -98,8 +98,9 @@ Practical rules:
 - Use `-o -` or `--stdout` explicitly if you want decrypted plaintext on stdout
 
 Recovery note:
-- the ciphertext stores the recovery and algorithm metadata needed for `vaultcrypt info`
-- if you lose the tool, the source comment at the top of `vaultcrypt.c` describes the exact format and key split needed to decrypt with another implementation
+- `vaultcrypt info` prints the full header, including the raw header hex plus the salt and IV
+- the ciphertext stores the algorithm and KDF metadata needed for recovery with another implementation
+- if you lose the tool, the source comment at the top of `vaultcrypt.c` still describes the exact header and key derivation needed to decrypt with another implementation
 
 ## Shell
 
@@ -362,11 +363,17 @@ Fields shown:
 - Terminal
 - Resolution
 - CPU
+- Cores
 - GPU
+- Temps
+- Load
 - Memory
+- Swap
 - Battery
+- Battery Health
 - Local IP
 - Disk
+- Packages
 
 Usage:
 

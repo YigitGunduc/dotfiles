@@ -56,6 +56,7 @@ typedef struct {
   char cpu[128];
   char cpu_cores[64];
   char gpu[256];
+  char temps[256];
   char load_avg[64];
   char memory[128];
   char swap[128];
@@ -78,6 +79,7 @@ typedef struct {
   bool show_logo;
   bool compact;
   bool json;
+  bool allow_sudo_prompt;
   size_t selected_count;
   size_t selected_indices[MAX_SELECTED_FIELDS];
 } OutputOptions;
@@ -132,6 +134,7 @@ static const FieldDef FIELD_DEFS[] = {
   {"cpu", "cpu", "CPU", offsetof(SystemInfo, cpu), true},
   {"cores", "cores", "Cores", offsetof(SystemInfo, cpu_cores), true},
   {"gpu", "gpu", "GPU", offsetof(SystemInfo, gpu), true},
+  {"temps", "temps", "Temps", offsetof(SystemInfo, temps), true},
   {"load", "load", "Load", offsetof(SystemInfo, load_avg), true},
   {"memory", "memory", "Memory", offsetof(SystemInfo, memory), true},
   {"swap", "swap", "Swap", offsetof(SystemInfo, swap), true},
@@ -151,7 +154,11 @@ static void copy_string(char *dst, size_t dst_size, const char *src) {
     dst[0] = '\0';
     return;
   }
+#ifdef __APPLE__
+  strlcpy(dst, src, dst_size);
+#else
   snprintf(dst, dst_size, "%s", src);
+#endif
 }
 
 static const char *base_name(const char *path) {
@@ -194,7 +201,11 @@ static void append_text(char *out, size_t out_size, const char *text) {
     return;
   }
 
+#ifdef __APPLE__
+  strlcat(out, text, out_size);
+#else
   snprintf(out + len, out_size - len, "%s", text);
+#endif
 }
 
 static void append_list_item(char *out, size_t out_size, const char *item) {
@@ -205,6 +216,108 @@ static void append_list_item(char *out, size_t out_size, const char *item) {
     append_text(out, out_size, ", ");
   }
   append_text(out, out_size, item);
+}
+
+static bool string_contains_ci(const char *haystack, const char *needle) {
+  size_t needle_len;
+
+  if (haystack == NULL || needle == NULL) {
+    return false;
+  }
+
+  needle_len = strlen(needle);
+  if (needle_len == 0) {
+    return true;
+  }
+
+  while (*haystack != '\0') {
+    size_t i = 0;
+
+    while (haystack[i] != '\0' && needle[i] != '\0' &&
+           tolower((unsigned char) haystack[i]) ==
+             tolower((unsigned char) needle[i])) {
+      i++;
+    }
+    if (i == needle_len) {
+      return true;
+    }
+    haystack++;
+  }
+
+  return false;
+}
+
+#ifndef __APPLE__
+static bool string_ends_with(const char *value, const char *suffix) {
+  size_t value_len;
+  size_t suffix_len;
+
+  if (value == NULL || suffix == NULL) {
+    return false;
+  }
+
+  value_len = strlen(value);
+  suffix_len = strlen(suffix);
+  if (suffix_len > value_len) {
+    return false;
+  }
+
+  return strcmp(value + value_len - suffix_len, suffix) == 0;
+}
+#endif
+
+static bool parse_double_from_text(const char *text, double *out) {
+  const char *p;
+
+  if (text == NULL || out == NULL) {
+    return false;
+  }
+
+  for (p = text; *p != '\0'; p++) {
+    if (*p == '-' || *p == '+' || *p == '.' || isdigit((unsigned char) *p)) {
+      if (sscanf(p, "%lf", out) == 1) {
+        return true;
+      }
+    }
+  }
+
+  return false;
+}
+
+static bool parse_label_before_colon(const char *line, char *out, size_t out_size) {
+  const char *colon;
+  size_t len;
+
+  if (line == NULL || out == NULL || out_size == 0) {
+    return false;
+  }
+
+  colon = strchr(line, ':');
+  if (colon == NULL || colon == line) {
+    out[0] = '\0';
+    return false;
+  }
+
+  len = (size_t) (colon - line);
+  if (len >= out_size) {
+    len = out_size - 1;
+  }
+  memcpy(out, line, len);
+  out[len] = '\0';
+  trim_in_place(out);
+  return out[0] != '\0';
+}
+
+static void append_temperature_item(char *out, size_t out_size, const char *label,
+                                    double value_c) {
+  char item[64];
+
+  if (label == NULL || label[0] == '\0') {
+    return;
+  }
+
+  snprintf(item, sizeof(item), "%s %.1fC", label, value_c);
+  append_list_item(out, out_size, item);
 }
 
 static bool parse_int_after_equals(const char *line, int *out) {
@@ -350,6 +463,22 @@ static bool read_ull_file(const char *path, unsigned long long *out) {
   }
 
   if (fscanf(fp, "%llu", out) == 1) {
+    fclose(fp);
+    return true;
+  }
+
+  fclose(fp);
+  return false;
+}
+
+static bool read_ll_file(const char *path, long long *out) {
+  FILE *fp = fopen(path, "r");
+
+  if (fp == NULL) {
+    return false;
+  }
+
+  if (fscanf(fp, "%lld", out) == 1) {
     fclose(fp);
     return true;
   }
@@ -755,6 +884,16 @@ static bool sysctl_u32(const char *name, uint32_t *out) {
   return true;
 }
 
+static bool sysctl_timeval_value(const char *name, struct timeval *out) {
+  size_t len = sizeof(*out);
+
+  if (sysctlbyname(name, out, &len, NULL, 0) != 0 || len != sizeof(*out)) {
+    return false;
+  }
+
+  return true;
+}
+
 static bool io_registry_copy_string(io_registry_entry_t service,
                                     const char *key_name, char *out,
                                     size_t out_size) {
@@ -824,61 +963,64 @@ static void get_os_name(char *out, size_t out_size) {
 }
 
 static void get_uptime_string(char *out, size_t out_size) {
-  FILE *fp = popen("who -b 2>/dev/null", "r");
+#ifdef CLOCK_UPTIME_RAW
+  struct timespec uptime_ts;
 
-  if (fp != NULL) {
-    char buffer[256];
+  if (clock_gettime(CLOCK_UPTIME_RAW, &uptime_ts) == 0 &&
+      uptime_ts.tv_sec > 0) {
+    format_uptime((unsigned long long) uptime_ts.tv_sec, out, out_size);
+    return;
+  }
+#endif
 
-    if (fgets(buffer, sizeof(buffer), fp) != NULL) {
-      char month[8];
-      int day = 0;
-      int hour = 0;
-      int minute = 0;
+  struct timeval boot_time;
+  time_t now = time(NULL);
 
-      if (sscanf(buffer, "%*s %*s %7s %d %d:%d",
-                 month, &day, &hour, &minute) == 4) {
-        struct tm tm_boot;
-        struct tm tm_now;
-        char stamp[64];
-        time_t now = time(NULL);
-        time_t boot;
-
-        localtime_r(&now, &tm_now);
-        memset(&tm_boot, 0, sizeof(tm_boot));
-        tm_boot.tm_year = tm_now.tm_year;
-        tm_boot.tm_isdst = -1;
-
-        snprintf(stamp, sizeof(stamp), "%s %d %02d:%02d",
-                 month, day, hour, minute);
-        if (strptime(stamp, "%b %d %H:%M", &tm_boot) != NULL) {
-          boot = mktime(&tm_boot);
-          if (boot > now) {
-            tm_boot.tm_year--;
-            boot = mktime(&tm_boot);
-          }
-          if (boot > 0 && now > boot) {
-            pclose(fp);
-            format_uptime((unsigned long long) (now - boot), out, out_size);
-            return;
-          }
-        }
-      }
-    }
-    pclose(fp);
+  if (sysctl_timeval_value("kern.boottime", &boot_time) &&
+      boot_time.tv_sec > 0 && now > boot_time.tv_sec) {
+    format_uptime((unsigned long long) (now - boot_time.tv_sec), out, out_size);
+    return;
   }
 
   copy_string(out, out_size, "unknown");
 }
 
 static void get_cpu_cores_string(char *out, size_t out_size) {
+  uint32_t performance = 0;
+  uint32_t efficiency = 0;
   uint32_t physical = 0;
   uint32_t logical = 0;
+  bool has_performance;
+  bool has_efficiency;
 
+  has_performance = sysctl_u32("hw.perflevel0.physicalcpu", &performance);
+  has_efficiency = sysctl_u32("hw.perflevel1.physicalcpu", &efficiency);
   sysctl_u32("hw.physicalcpu", &physical);
   sysctl_u32("hw.logicalcpu", &logical);
 
-  if (physical > 0 && logical > 0) {
+  if ((has_performance || has_efficiency) &&
+      (performance + efficiency) > 0) {
+    uint32_t total = performance + efficiency;
+
+    if (performance > 0 && efficiency > 0) {
+      snprintf(out, out_size, "%u cores (%uP, %uE)",
+               total, performance, efficiency);
+      return;
+    }
+    if (performance > 0) {
+      snprintf(out, out_size, "%u cores (%uP)", total, performance);
+      return;
+    }
+
+    snprintf(out, out_size, "%u cores (%uE)", total, efficiency);
+    return;
+  }
+  if (physical > 0 && logical > physical) {
     snprintf(out, out_size, "%u physical / %u logical", physical, logical);
+    return;
+  }
+  if (physical > 0) {
+    snprintf(out, out_size, "%u cores", physical);
     return;
   }
   if (logical > 0) {
@@ -999,6 +1141,176 @@ static void get_gpu_name(char *out, size_t out_size) {
   copy_string(out, out_size, gpu_model);
 }
 
+static bool append_powermetrics_temperature_line(char *out, size_t out_size,
+                                                 const char *line,
+                                                 bool *cpu_added,
+                                                 bool *gpu_added,
+                                                 bool *soc_added,
+                                                 bool *ssd_added,
+                                                 bool *ane_added,
+                                                 unsigned int *generic_count) {
+  char label[128];
+  double value_c = 0.0;
+  const char *colon;
+  bool temperature_like;
+
+  if (line == NULL) {
+    return false;
+  }
+  temperature_like =
+    string_contains_ci(line, "temperature") ||
+    string_contains_ci(line, " temp") ||
+    string_contains_ci(line, "_temp") ||
+    string_contains_ci(line, "tdev") ||
+    string_contains_ci(line, "eacc") ||
+    string_contains_ci(line, "macc") ||
+    string_contains_ci(line, "pacc");
+  if (!temperature_like) {
+    return false;
+  }
+
+  colon = strchr(line, ':');
+  if (colon == NULL ||
+      !parse_double_from_text(colon + 1, &value_c) ||
+      !parse_label_before_colon(line, label, sizeof(label))) {
+    return false;
+  }
+
+  if (string_contains_ci(label, "cpu")) {
+    if (*cpu_added) {
+      return false;
+    }
+    append_temperature_item(out, out_size, "CPU", value_c);
+    *cpu_added = true;
+    return true;
+  }
+  if (string_contains_ci(label, "gpu")) {
+    if (*gpu_added) {
+      return false;
+    }
+    append_temperature_item(out, out_size, "GPU", value_c);
+    *gpu_added = true;
+    return true;
+  }
+  if (string_contains_ci(label, "soc") || string_contains_ci(label, "package")) {
+    if (*soc_added) {
+      return false;
+    }
+    append_temperature_item(out, out_size, "SoC", value_c);
+    *soc_added = true;
+    return true;
+  }
+  if (string_contains_ci(label, "ssd") || string_contains_ci(label, "nvme") ||
+      string_contains_ci(label, "nand") || string_contains_ci(label, "drive")) {
+    if (*ssd_added) {
+      return false;
+    }
+    append_temperature_item(out, out_size, "SSD", value_c);
+    *ssd_added = true;
+    return true;
+  }
+  if (string_contains_ci(label, "ane")) {
+    if (*ane_added) {
+      return false;
+    }
+    append_temperature_item(out, out_size, "ANE", value_c);
+    *ane_added = true;
+    return true;
+  }
+  if (*generic_count >= 2) {
+    return false;
+  }
+
+  append_temperature_item(out, out_size, label, value_c);
+  (*generic_count)++;
+  return true;
+}
+
+static bool collect_powermetrics_text(const char *args, char *out, size_t out_size,
+                                      char *pressure, size_t pressure_size,
+                                      bool *needs_sudo, bool allow_sudo_prompt) {
+  char cmd[256];
+  FILE *fp;
+  char line[512];
+  bool cpu_added = false;
+  bool gpu_added = false;
+  bool soc_added = false;
+  bool ssd_added = false;
+  bool ane_added = false;
+  unsigned int generic_count = 0;
+  bool saw_output = false;
+  bool found_temps = false;
+
+  if (geteuid() == 0) {
+    snprintf(cmd, sizeof(cmd), "powermetrics -n 1 %s 2>/dev/null", args);
+  } else if (allow_sudo_prompt) {
+    snprintf(cmd, sizeof(cmd), "sudo powermetrics -n 1 %s 2>/dev/null", args);
+  } else {
+    snprintf(cmd, sizeof(cmd), "sudo -n powermetrics -n 1 %s 2>/dev/null", args);
+  }
+
+  fp = popen(cmd, "r");
+  if (fp == NULL) {
+    return false;
+  }
+
+  while (fgets(line, sizeof(line), fp) != NULL) {
+    saw_output = true;
+    trim_in_place(line);
+    if (line[0] == '\0') {
+      continue;
+    }
+    if (append_powermetrics_temperature_line(out, out_size, line, &cpu_added,
+                                             &gpu_added, &soc_added, &ssd_added,
+                                             &ane_added, &generic_count)) {
+      found_temps = true;
+      continue;
+    }
+    if (!string_contains_ci(line, "temperature") &&
+        string_contains_ci(line, "pressure") &&
+        strchr(line, ':') != NULL &&
+        parse_label_before_colon(line, pressure, pressure_size)) {
+      const char *colon = strchr(line, ':');
+
+      if (colon != NULL) {
+        copy_string(pressure, pressure_size, colon + 1);
+        trim_in_place(pressure);
+      }
+    }
+  }
+
+  pclose(fp);
+  if (!saw_output && geteuid() != 0 && !allow_sudo_prompt && needs_sudo != NULL) {
+    *needs_sudo = true;
+  }
+  return found_temps;
+}
+
+static void get_temperatures_string(char *out, size_t out_size,
+                                    bool allow_sudo_prompt) {
+  char pressure[64];
+  bool needs_sudo = false;
+
+  out[0] = '\0';
+  pressure[0] = '\0';
+
+  if (collect_powermetrics_text("-s smc,thermal,cpu_power", out, out_size,
+                                pressure, sizeof(pressure), &needs_sudo,
+                                allow_sudo_prompt) ||
+      collect_powermetrics_text("-s cpu_power,thermal", out, out_size,
+                                pressure, sizeof(pressure), &needs_sudo,
+                                allow_sudo_prompt)) {
+    return;
+  }
+
+  if (needs_sudo) {
+    copy_string(out, out_size, "requires sudo");
+    return;
+  }
+
+  copy_string(out, out_size, "n/a");
+}
+
 static void append_resolution_mode(char *out, size_t out_size,
                                    size_t width, size_t height) {
   char item[32];
@@ -1009,15 +1321,6 @@ static void append_resolution_mode(char *out, size_t out_size,
 
   snprintf(item, sizeof(item), "%zux%zu", width, height);
   append_list_item(out, out_size, item);
-}
-
-static void append_resolution_line(char *out, size_t out_size, const char *line) {
-  unsigned int width = 0;
-  unsigned int height = 0;
-
-  if (sscanf(line, "Resolution: %u x %u", &width, &height) == 2) {
-    append_resolution_mode(out, out_size, width, height);
-  }
 }
 
 static void get_resolution_string(char *out, size_t out_size) {
@@ -1041,19 +1344,6 @@ static void get_resolution_string(char *out, size_t out_size) {
     return;
   }
 
-  {
-    FILE *fp = popen("system_profiler SPDisplaysDataType 2>/dev/null", "r");
-    if (fp != NULL) {
-      char line[256];
-
-      while (fgets(line, sizeof(line), fp) != NULL) {
-        trim_in_place(line);
-        append_resolution_line(out, out_size, line);
-      }
-      pclose(fp);
-    }
-  }
-
   if (out[0] == '\0') {
     copy_string(out, out_size, "unknown");
   }
@@ -1061,78 +1351,67 @@ static void get_resolution_string(char *out, size_t out_size) {
 
 static void get_memory_string(char *out, size_t out_size) {
   uint64_t total_bytes = 0;
+  struct xsw_usage swap_usage;
+  size_t swap_len = sizeof(swap_usage);
+  mach_port_t host_port = mach_host_self();
+  mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
+  vm_statistics64_data_t vm_stat;
+  vm_size_t page_size = 0;
+  unsigned long long used_bytes;
+  unsigned long long compressed_bytes;
+  unsigned long long swap_bytes = 0;
   char used_text[32];
   char total_text[32];
+  char compressed_text[32];
+  char swap_text[32];
 
   if (!sysctl_u64("hw.memsize", &total_bytes)) {
     copy_string(out, out_size, "unknown");
     return;
   }
 
-  {
-    FILE *fp = popen("vm_stat 2>/dev/null", "r");
-    if (fp != NULL) {
-      char line[256];
-      unsigned long long page_size = 0;
-      unsigned long long active = 0;
-      unsigned long long wired = 0;
-      unsigned long long compressed = 0;
-
-      while (fgets(line, sizeof(line), fp) != NULL) {
-        if (sscanf(line, "Mach Virtual Memory Statistics: (page size of %llu bytes)",
-                   &page_size) == 1) {
-          continue;
-        }
-        if (sscanf(line, "Pages active: %llu.", &active) == 1) {
-          continue;
-        }
-        if (sscanf(line, "Pages wired down: %llu.", &wired) == 1) {
-          continue;
-        }
-        if (sscanf(line, "Pages occupied by compressor: %llu.", &compressed) == 1) {
-          continue;
-        }
-      }
-      pclose(fp);
-
-      if (page_size > 0) {
-        unsigned long long used_bytes =
-          (active + wired + compressed) * page_size;
-        human_bytes(used_bytes, used_text, sizeof(used_text));
-        format_memory_total_label(total_bytes, total_text, sizeof(total_text));
-        snprintf(out, out_size, "%s / %s", used_text, total_text);
-        return;
-      }
-    }
+  if (host_page_size(host_port, &page_size) != KERN_SUCCESS) {
+    copy_string(out, out_size, "unknown");
+    return;
   }
 
-  {
-    mach_port_t host_port = mach_host_self();
-    mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
-    vm_statistics64_data_t vm_stat;
-    vm_size_t page_size = 0;
-    unsigned long long used_bytes;
-
-    if (host_page_size(host_port, &page_size) != KERN_SUCCESS) {
-      copy_string(out, out_size, "unknown");
-      return;
-    }
-
-    if (host_statistics64(host_port, HOST_VM_INFO64, (host_info64_t) &vm_stat,
-                          &count) != KERN_SUCCESS) {
-      copy_string(out, out_size, "unknown");
-      return;
-    }
-
-    used_bytes = ((unsigned long long) vm_stat.active_count +
-                  (unsigned long long) vm_stat.wire_count +
-                  (unsigned long long) vm_stat.compressor_page_count) *
-                 (unsigned long long) page_size;
-
-    human_bytes(used_bytes, used_text, sizeof(used_text));
-    format_memory_total_label(total_bytes, total_text, sizeof(total_text));
-    snprintf(out, out_size, "%s / %s", used_text, total_text);
+  if (host_statistics64(host_port, HOST_VM_INFO64, (host_info64_t) &vm_stat,
+                        &count) != KERN_SUCCESS) {
+    copy_string(out, out_size, "unknown");
+    return;
   }
+
+  used_bytes = ((unsigned long long) vm_stat.active_count +
+                (unsigned long long) vm_stat.wire_count +
+                (unsigned long long) vm_stat.compressor_page_count) *
+               (unsigned long long) page_size;
+  compressed_bytes =
+    (unsigned long long) vm_stat.compressor_page_count *
+    (unsigned long long) page_size;
+
+  if (sysctlbyname("vm.swapusage", &swap_usage, &swap_len, NULL, 0) == 0 &&
+      swap_len == sizeof(swap_usage)) {
+    swap_bytes = swap_usage.xsu_used;
+  }
+
+  human_bytes(used_bytes, used_text, sizeof(used_text));
+  format_memory_total_label(total_bytes, total_text, sizeof(total_text));
+
+  if (swap_bytes > 0) {
+    human_bytes(compressed_bytes, compressed_text, sizeof(compressed_text));
+    human_bytes(swap_bytes, swap_text, sizeof(swap_text));
+    snprintf(out, out_size, "%s / %s (compressed %s, swap %s)",
+             used_text, total_text, compressed_text, swap_text);
+    return;
+  }
+  if (compressed_bytes > 0) {
+    human_bytes(compressed_bytes, compressed_text, sizeof(compressed_text));
+    snprintf(out, out_size, "%s / %s (compressed %s)",
+             used_text, total_text, compressed_text);
+    return;
+  }
+
+  snprintf(out, out_size, "%s / %s", used_text, total_text);
 }
 
 static void get_swap_string(char *out, size_t out_size) {
@@ -1631,6 +1910,156 @@ static void get_gpu_name(char *out, size_t out_size) {
   copy_string(out, out_size, "unknown");
 }
 
+static bool linux_temperature_label(const char *chip, const char *label,
+                                    char *out, size_t out_size) {
+  if ((chip != NULL &&
+       (string_contains_ci(chip, "coretemp") || string_contains_ci(chip, "k10temp") ||
+        string_contains_ci(chip, "cpu") || string_contains_ci(chip, "zenpower"))) ||
+      (label != NULL &&
+       (string_contains_ci(label, "package") || string_contains_ci(label, "tctl") ||
+        string_contains_ci(label, "tdie") || string_contains_ci(label, "cpu") ||
+        string_contains_ci(label, "core ")))) {
+    if (label != NULL && string_contains_ci(label, "core ")) {
+      copy_string(out, out_size, label);
+    } else {
+      copy_string(out, out_size, "CPU");
+    }
+    return true;
+  }
+  if ((chip != NULL &&
+       (string_contains_ci(chip, "amdgpu") || string_contains_ci(chip, "gpu"))) ||
+      (label != NULL && string_contains_ci(label, "gpu"))) {
+    copy_string(out, out_size, "GPU");
+    return true;
+  }
+  if ((chip != NULL &&
+       (string_contains_ci(chip, "nvme") || string_contains_ci(chip, "drivetemp"))) ||
+      (label != NULL &&
+       (string_contains_ci(label, "composite") || string_contains_ci(label, "ssd") ||
+        string_contains_ci(label, "nvme") || string_contains_ci(label, "nand")))) {
+    copy_string(out, out_size, "SSD");
+    return true;
+  }
+
+  if (label != NULL && label[0] != '\0') {
+    copy_string(out, out_size, label);
+    return true;
+  }
+  if (chip != NULL && chip[0] != '\0') {
+    copy_string(out, out_size, chip);
+    return true;
+  }
+
+  return false;
+}
+
+static void get_temperatures_string(char *out, size_t out_size,
+                                    bool allow_sudo_prompt) {
+  (void) allow_sudo_prompt;
+  DIR *dir = opendir("/sys/class/hwmon");
+  struct dirent *entry;
+  bool cpu_added = false;
+  bool gpu_added = false;
+  bool ssd_added = false;
+  unsigned int generic_count = 0;
+
+  out[0] = '\0';
+  if (dir == NULL) {
+    copy_string(out, out_size, "n/a");
+    return;
+  }
+
+  while ((entry = readdir(dir)) != NULL) {
+    DIR *sensor_dir;
+    struct dirent *sensor_entry;
+    char base_path[512];
+    char chip_name[64];
+
+    if (entry->d_name[0] == '.') {
+      continue;
+    }
+
+    snprintf(base_path, sizeof(base_path), "/sys/class/hwmon/%s", entry->d_name);
+    chip_name[0] = '\0';
+    {
+      char name_path[576];
+
+      snprintf(name_path, sizeof(name_path), "%s/name", base_path);
+      read_first_line(name_path, chip_name, sizeof(chip_name));
+    }
+
+    sensor_dir = opendir(base_path);
+    if (sensor_dir == NULL) {
+      continue;
+    }
+
+    while ((sensor_entry = readdir(sensor_dir)) != NULL) {
+      char input_path[576];
+      char label_path[576];
+      char label[64];
+      char sensor_label[64];
+      long long raw_value = 0;
+      double value_c;
+
+      if (!string_ends_with(sensor_entry->d_name, "_input") ||
+          strncmp(sensor_entry->d_name, "temp", 4) != 0) {
+        continue;
+      }
+
+      snprintf(input_path, sizeof(input_path), "%s/%s", base_path, sensor_entry->d_name);
+      if (!read_ll_file(input_path, &raw_value)) {
+        continue;
+      }
+
+      value_c = (double) raw_value / 1000.0;
+      if (value_c < -40.0 || value_c > 140.0) {
+        continue;
+      }
+
+      copy_string(label, sizeof(label), "");
+      snprintf(label_path, sizeof(label_path), "%s/%s", base_path, sensor_entry->d_name);
+      memcpy(label_path + strlen(label_path) - strlen("_input"), "_label", strlen("_label") + 1);
+      read_first_line(label_path, label, sizeof(label));
+
+      if (!linux_temperature_label(chip_name, label, sensor_label,
+                                   sizeof(sensor_label))) {
+        continue;
+      }
+      if (strcmp(sensor_label, "CPU") == 0 && cpu_added) {
+        continue;
+      }
+      if (strcmp(sensor_label, "GPU") == 0 && gpu_added) {
+        continue;
+      }
+      if (strcmp(sensor_label, "SSD") == 0 && ssd_added) {
+        continue;
+      }
+      if (strcmp(sensor_label, "CPU") != 0 && strcmp(sensor_label, "GPU") != 0 &&
+          strcmp(sensor_label, "SSD") != 0 && generic_count >= 4) {
+        continue;
+      }
+
+      append_temperature_item(out, out_size, sensor_label, value_c);
+      if (strcmp(sensor_label, "CPU") == 0) {
+        cpu_added = true;
+      } else if (strcmp(sensor_label, "GPU") == 0) {
+        gpu_added = true;
+      } else if (strcmp(sensor_label, "SSD") == 0) {
+        ssd_added = true;
+      } else {
+        generic_count++;
+      }
+    }
+
+    closedir(sensor_dir);
+  }
+
+  closedir(dir);
+  if (out[0] == '\0') {
+    copy_string(out, out_size, "n/a");
+  }
+}
+
 static void append_linux_mode(char *out, size_t out_size, const char *mode) {
   char item[64];
 
@@ -1837,7 +2266,7 @@ static void get_packages_string(char *out, size_t out_size) {
 }
 #endif
 
-static void fill_system_info(SystemInfo *info) {
+static void fill_system_info(SystemInfo *info, const OutputOptions *options) {
   get_username(info->username, sizeof(info->username));
   get_hostname_short(info->hostname, sizeof(info->hostname));
   get_shell_name(info->shell, sizeof(info->shell));
@@ -1854,6 +2283,8 @@ static void fill_system_info(SystemInfo *info) {
   get_cpu_name(info->cpu, sizeof(info->cpu));
   get_cpu_cores_string(info->cpu_cores, sizeof(info->cpu_cores));
   get_gpu_name(info->gpu, sizeof(info->gpu));
+  get_temperatures_string(info->temps, sizeof(info->temps),
+                          options != NULL && options->allow_sudo_prompt);
   get_load_string(info->load_avg, sizeof(info->load_avg));
   get_memory_string(info->memory, sizeof(info->memory));
   get_swap_string(info->swap, sizeof(info->swap));
@@ -1869,6 +2300,9 @@ static void fill_system_info(SystemInfo *info) {
   }
   if (info->gpu[0] == '\0') {
     copy_string(info->gpu, sizeof(info->gpu), "unknown");
+  }
+  if (info->temps[0] == '\0') {
+    copy_string(info->temps, sizeof(info->temps), "n/a");
   }
   if (info->battery[0] == '\0') {
     copy_string(info->battery, sizeof(info->battery), "n/a");
@@ -2199,6 +2633,8 @@ static void usage(FILE *stream, const char *argv0) {
           "  --no-logo        Disable the logo column\n"
           "  --compact        Compact text output (implies --no-logo)\n"
           "  --json           Print JSON\n"
+          "  --allow-sudo-prompt\n"
+          "                   Allow sudo password prompts for temp sensors\n"
           "  --field NAME     Print only a field (repeat or use commas)\n"
           "  --list-fields    List selectable fields\n"
           "  -h, --help       Show this help\n",
@@ -2217,8 +2653,10 @@ int main(int argc, char **argv) {
     .show_logo = true,
     .compact = false,
     .json = false,
+    .allow_sudo_prompt = false,
     .selected_count = 0
   };
+  const char *allow_sudo_prompt_env = getenv("MINIFETCH_ALLOW_SUDO_PROMPT");
   SystemInfo info;
   const char *no_color_env = getenv("NO_COLOR");
   int i;
@@ -2247,6 +2685,10 @@ int main(int argc, char **argv) {
       options.json = true;
       options.show_logo = false;
       colors.use_color = false;
+      continue;
+    }
+    if (strcmp(argv[i], "--allow-sudo-prompt") == 0) {
+      options.allow_sudo_prompt = true;
       continue;
     }
     if (strcmp(argv[i], "--list-fields") == 0) {
@@ -2278,6 +2720,9 @@ int main(int argc, char **argv) {
       (no_color_env != NULL && no_color_env[0] != '\0')) {
     colors.use_color = false;
   }
+  if (allow_sudo_prompt_env != NULL && allow_sudo_prompt_env[0] != '\0') {
+    options.allow_sudo_prompt = true;
+  }
 
   if (!colors.use_color) {
     colors.c1 = "";
@@ -2286,7 +2731,7 @@ int main(int argc, char **argv) {
     colors.reset = "";
   }
 
-  fill_system_info(&info);
+  fill_system_info(&info, &options);
   if (options.json) {
     print_json_output(&info, &options);
   } else {

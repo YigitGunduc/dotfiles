@@ -36,6 +36,7 @@ ACCENT = "bold cyan"
 SUCCESS = "bold green"
 WARNING = "bold yellow"
 ERROR = "bold red"
+INFO = "bold blue"
 
 Console = rich_console.Console if rich_console else None
 Live = rich_live.Live if rich_live else None
@@ -259,6 +260,16 @@ def seconds_remaining(interval: int) -> int:
     return interval if remaining == 0 else remaining
 
 
+def format_code(code: str) -> str:
+    midpoint = len(code) // 2
+    return f"{code[:midpoint]} {code[midpoint:]}"
+
+
+def progress_bar(remaining: int, interval: int, width: int = 20) -> str:
+    filled = max(1, round((remaining / interval) * width))
+    return f"[{'━' * filled}{' ' * (width - filled)}]"
+
+
 def record_uri(record: SecretRecord, username: str | None = None) -> str:
     user = username or current_user()
     label = quote(f"{record.label}:{user}")
@@ -341,6 +352,123 @@ def list_services() -> int:
     return 0
 
 
+def dashboard_table() -> Table:
+    services = load_index()
+    table = Table(
+        title=f"{APP_NAME} dashboard for {current_user()}",
+        border_style="bright_black",
+        expand=False,
+    )
+    table.add_column("Service", style=ACCENT)
+    table.add_column("Code", style="bold white")
+    table.add_column("TTL", justify="right")
+    table.add_column("Window")
+    table.add_column("Status")
+
+    if not services:
+        table.add_row(
+            "-",
+            "-",
+            "-",
+            "-",
+            f"[{WARNING}]No services stored. Run `auther add <service>` to add one.[/]",
+        )
+        return table
+
+    for service in services:
+        try:
+            record = load_record(service)
+            totp = build_totp(record)
+            code = totp.now()
+            remaining = seconds_remaining(record.interval)
+            table.add_row(
+                record.label,
+                format_code(code),
+                f"{remaining}s",
+                f"[dim]{progress_bar(remaining, record.interval, width=12)}[/]",
+                f"[green]{record.digits} digits / {record.interval}s[/]",
+            )
+        except AuthError:
+            table.add_row(service, "-", "-", "-", "[red]missing or invalid[/]")
+
+    return table
+
+
+def render_dashboard(message: str | None = None) -> None:
+    console.clear()
+    content = Table.grid(padding=1)
+    content.add_row(f"[dim]{APP_NAME}[/] [cyan]•[/] [dim]macOS user: {current_user()}[/]")
+    content.add_row(dashboard_table())
+    if message:
+        content.add_row(message)
+    content.add_row(
+        "[dim]Commands:[/] [bold]show[/] <service>, [bold]add[/], [bold]remove[/] <service>, "
+        "[bold]list[/], [bold]help[/], [bold]quit[/]"
+    )
+    console.print(Panel(content, border_style="bright_black", expand=False))
+
+
+def dashboard_help() -> str:
+    return (
+        f"[{INFO}]App commands:[/] "
+        "[bold]add[/] starts secret entry, "
+        "[bold]remove <service>[/] deletes a secret, "
+        "[bold]show <service>[/] opens the focused live code view, "
+        "[bold]list[/] redraws the dashboard, "
+        "[bold]quit[/] exits."
+    )
+
+
+def dashboard_command_loop() -> int:
+    message = dashboard_help()
+    while True:
+        render_dashboard(message)
+        raw = Prompt.ask("[bold white]auther[/bold white]").strip()
+        if not raw:
+            message = None
+            continue
+
+        parts = raw.split(maxsplit=1)
+        command = parts[0].lower()
+        argument = parts[1].strip() if len(parts) > 1 else None
+
+        if command in {"quit", "exit", "q"}:
+            return 0
+        if command in {"help", "h", "?"}:
+            message = dashboard_help()
+            continue
+        if command in {"list", "ls", "refresh"}:
+            message = None
+            continue
+        if command == "add":
+            store_secret_interactive(argument)
+            message = f"[{SUCCESS}]Dashboard updated.[/]"
+            continue
+        if command == "remove":
+            if not argument:
+                message = f"[{WARNING}]Usage: remove <service>[/]"
+                continue
+            remove_service(argument)
+            message = f"[{SUCCESS}]Dashboard updated.[/]"
+            continue
+        if command == "show":
+            if not argument:
+                message = f"[{WARNING}]Usage: show <service>[/]"
+                continue
+            show_code(argument)
+            message = None
+            continue
+
+        message = f"[{WARNING}]Unknown command:[/] {raw}"
+
+
+def run_dashboard(once: bool = False) -> int:
+    if once:
+        render_dashboard()
+        return 0
+    return dashboard_command_loop()
+
+
 def show_code(service: str, once: bool = False, reveal_uri: bool = False) -> int:
     record = load_record(service)
     totp = build_totp(record)
@@ -357,11 +485,8 @@ def show_code(service: str, once: bool = False, reveal_uri: bool = False) -> int
             table = Table.grid(padding=1)
             table.add_column(style=ACCENT, justify="left")
             table.add_row(f"  {record.label.upper()}")
-            table.add_row(f"  [bold white]{code[:3]} {code[3:]}[/]")
-
-            width = 20
-            filled = max(1, round((remaining / record.interval) * width))
-            progress = f"[{'━' * filled}{' ' * (width - filled)}]"
+            table.add_row(f"  [bold white]{format_code(code)}[/]")
+            progress = progress_bar(remaining, record.interval)
             table.add_row(f"  [dim]{progress} {remaining}s[/]")
             table.add_row(f"  [dim]macOS user: {current_user()}[/]")
 
@@ -396,6 +521,8 @@ def build_parser() -> argparse.ArgumentParser:
     remove_parser.add_argument("service", help="Service name to remove.")
 
     subparsers.add_parser("list", help="List services stored for the current macOS user.")
+    app_parser = subparsers.add_parser("app", help="Launch the interactive dashboard.")
+    app_parser.add_argument("--once", action="store_true", help="Render one dashboard frame and exit.")
 
     return parser
 
@@ -417,22 +544,31 @@ def main(argv: list[str] | None = None) -> int:
 
     ensure_dependencies()
 
-    console.print(
-        f"[dim]{APP_NAME}[/] [cyan]•[/] [dim]macOS user: {current_user()}[/]\n"
-    )
-
     if not args.command:
-        parser.print_help()
-        return 1
+        return run_dashboard()
 
     if args.command == "add":
+        console.print(
+            f"[dim]{APP_NAME}[/] [cyan]•[/] [dim]macOS user: {current_user()}[/]\n"
+        )
         return store_secret_interactive(args.service)
     if args.command == "show":
+        console.print(
+            f"[dim]{APP_NAME}[/] [cyan]•[/] [dim]macOS user: {current_user()}[/]\n"
+        )
         return show_code(args.service, once=args.once, reveal_uri=args.reveal_uri)
     if args.command == "remove":
+        console.print(
+            f"[dim]{APP_NAME}[/] [cyan]•[/] [dim]macOS user: {current_user()}[/]\n"
+        )
         return remove_service(args.service)
     if args.command == "list":
+        console.print(
+            f"[dim]{APP_NAME}[/] [cyan]•[/] [dim]macOS user: {current_user()}[/]\n"
+        )
         return list_services()
+    if args.command == "app":
+        return run_dashboard(once=args.once)
 
     parser.print_help()
     return 1

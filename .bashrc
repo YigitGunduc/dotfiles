@@ -40,6 +40,10 @@ else
   alias ls='ls --color=auto'
 fi
 
+# Load personal API keys if the file exists
+if [ -f "$HOME/.secrets/api_keys.sh" ]; then
+    source "$HOME/.secrets/api_keys.sh"
+fi
 
 ########################################
 # Tooling
