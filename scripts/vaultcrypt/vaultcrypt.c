@@ -4,9 +4,11 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include <CommonCrypto/CommonCryptor.h>
+#include <CommonCrypto/CommonDigest.h>
 #include <CommonCrypto/CommonHMAC.h>
 #include <CommonCrypto/CommonKeyDerivation.h>
 #include <CommonCrypto/CommonRandom.h>
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <readpassphrase.h>
@@ -106,6 +108,23 @@
 #define MIN_ITERATIONS 100000u
 #define IO_CHUNK_SIZE 65536u
 #define PASS_MAX 1024u
+#define SHA256_HEX_LEN 64u
+#define NAME_KEY_LEN 32u
+#define MANIFEST_FILENAME ".vaultcrypt-manifest.vlt"
+#define NAME_KEY_CONTEXT "vaultcrypt-flat-path-v1"
+
+typedef struct {
+  char *rel_path;
+  uint64_t size;
+  char sha256_hex[SHA256_HEX_LEN + 1u];
+  int seen;
+} ManifestEntry;
+
+typedef struct {
+  ManifestEntry *items;
+  size_t len;
+  size_t cap;
+} Manifest;
 
 typedef enum {
   FORMAT_UNKNOWN = 0,
@@ -118,6 +137,8 @@ typedef struct {
   int allow_stdout;
   int require_tty;
   int info_json;
+  const char *keychain_service;
+  const char *keychain_account;
 } Options;
 
 typedef struct {
@@ -140,6 +161,7 @@ typedef struct {
 } VaultHeaderV4Info;
 
 static FILE *open_input_file(const char *path);
+static char *parent_dirname(const char *path);
 
 static void secure_bzero(void *ptr, size_t len) {
   volatile unsigned char *p = (volatile unsigned char *)ptr;
@@ -154,6 +176,8 @@ static void usage(FILE *stream, int exit_code) {
           "  vaultcrypt enc -i INPUT [-o OUTPUT] [-n ITERATIONS] [-f]\n"
           "  vaultcrypt dec -i INPUT [-o OUTPUT|-] [-f] [--stdout]\n"
           "  vaultcrypt info -i INPUT [--json]\n"
+          "  vaultcrypt syncdir -i SOURCE_DIR -o VAULT_DIR [-n ITERATIONS]\n"
+          "  vaultcrypt restoredir -i VAULT_DIR -o OUTPUT_DIR\n"
           "  vaultcrypt selftest\n"
           "\n"
           "Notes:\n"
@@ -164,7 +188,12 @@ static void usage(FILE *stream, int exit_code) {
           "  - enc prompts twice for a passphrase.\n"
           "  - dec authenticates the full ciphertext before releasing plaintext.\n"
           "  - enc OUTPUT defaults to INPUT.vlt.\n"
-          "  - dec requires -o PATH or explicit stdout with -o - or --stdout.\n");
+          "  - dec requires -o PATH or explicit stdout with -o - or --stdout.\n"
+          "  - syncdir keeps an encrypted manifest in the vault directory.\n"
+          "  - syncdir stores ciphertext as flat opaque filenames; plaintext paths only exist inside the encrypted manifest.\n"
+          "  - restoredir rebuilds the original plaintext filenames and directory tree from the manifest.\n"
+          "  - use --passphrase-keychain-service SERVICE to load the passphrase from macOS Keychain.\n"
+          "  - optional: --passphrase-keychain-account ACCOUNT (defaults to $USER).\n");
   exit(exit_code);
 }
 
@@ -175,6 +204,11 @@ static void fail_errno(const char *msg) {
 
 static void fail_msg(const char *msg) {
   fprintf(stderr, "vaultcrypt: %s\n", msg);
+  exit(1);
+}
+
+static void fail_path(const char *label, const char *path) {
+  fprintf(stderr, "vaultcrypt: %s: %s\n", label, path);
   exit(1);
 }
 
@@ -418,6 +452,417 @@ static char *xstrdup(const char *src) {
 
   memcpy(dst, src, len + 1u);
   return dst;
+}
+
+static char *xstrndup_local(const char *src, size_t len) {
+  char *dst = (char *)malloc(len + 1u);
+
+  if (dst == NULL) {
+    fail_msg("out of memory");
+  }
+  memcpy(dst, src, len);
+  dst[len] = '\0';
+  return dst;
+}
+
+static bool path_exists(const char *path) {
+  struct stat st;
+  return stat(path, &st) == 0;
+}
+
+static void require_directory(const char *path, const char *label) {
+  struct stat st;
+
+  if (stat(path, &st) != 0) {
+    fail_errno(path);
+  }
+  if (!S_ISDIR(st.st_mode)) {
+    fail_path(label, path);
+  }
+}
+
+static void ensure_dir_recursive(const char *path) {
+  char *copy;
+  size_t i;
+
+  if (path == NULL || path[0] == '\0') {
+    return;
+  }
+
+  copy = xstrdup(path);
+  for (i = 1; copy[i] != '\0'; ++i) {
+    if (copy[i] == '/') {
+      copy[i] = '\0';
+      if (copy[0] != '\0' && mkdir(copy, 0700) != 0 && errno != EEXIST) {
+        const int saved_errno = errno;
+        fprintf(stderr, "vaultcrypt: mkdir failed: %s: %s\n", copy, strerror(saved_errno));
+        free(copy);
+        exit(1);
+      }
+      copy[i] = '/';
+    }
+  }
+  if (mkdir(copy, 0700) != 0 && errno != EEXIST) {
+    const int saved_errno = errno;
+    fprintf(stderr, "vaultcrypt: mkdir failed: %s: %s\n", copy, strerror(saved_errno));
+    free(copy);
+    exit(1);
+  }
+  free(copy);
+}
+
+static void ensure_parent_dir(const char *path) {
+  char *parent = parent_dirname(path);
+  ensure_dir_recursive(parent);
+  free(parent);
+}
+
+static void remove_empty_parent_dirs_until(const char *path, const char *stop_dir) {
+  char *dir = parent_dirname(path);
+  size_t stop_len = strlen(stop_dir);
+
+  while (dir[0] != '\0' &&
+         strcmp(dir, ".") != 0 &&
+         strcmp(dir, "/") != 0 &&
+         strncmp(dir, stop_dir, stop_len) == 0 &&
+         (dir[stop_len] == '\0' || dir[stop_len] == '/')) {
+    if (strcmp(dir, stop_dir) == 0) {
+      break;
+    }
+    if (rmdir(dir) != 0) {
+      if (errno == ENOTEMPTY || errno == EEXIST || errno == ENOENT) {
+        break;
+      }
+      free(dir);
+      fail_errno("rmdir");
+    }
+    {
+      char *parent = parent_dirname(dir);
+      free(dir);
+      dir = parent;
+    }
+  }
+  free(dir);
+}
+
+static char *parent_dirname(const char *path) {
+  const char *slash = strrchr(path, '/');
+
+  if (slash == NULL) {
+    return xstrdup(".");
+  }
+  if (slash == path) {
+    return xstrdup("/");
+  }
+  return xstrndup_local(path, (size_t)(slash - path));
+}
+
+static char *join_path(const char *base, const char *suffix) {
+  size_t base_len = strlen(base);
+  size_t suffix_len = strlen(suffix);
+  int need_slash = base_len > 0u && base[base_len - 1u] != '/';
+  size_t len = base_len + (size_t)need_slash + suffix_len + 1u;
+  char *out = (char *)malloc(len);
+
+  if (out == NULL) {
+    fail_msg("out of memory");
+  }
+  snprintf(out, len, "%s%s%s", base, need_slash ? "/" : "", suffix);
+  return out;
+}
+
+static char *manifest_path(const char *vault_dir) {
+  return join_path(vault_dir, MANIFEST_FILENAME);
+}
+
+static void derive_name_key(const char *passphrase, uint8_t name_key[NAME_KEY_LEN]) {
+  CCHmac(kCCHmacAlgSHA256,
+         passphrase,
+         strlen(passphrase),
+         NAME_KEY_CONTEXT,
+         strlen(NAME_KEY_CONTEXT),
+         name_key);
+}
+
+static char *opaque_vault_filename(const char *rel_path, const uint8_t name_key[NAME_KEY_LEN]) {
+  uint8_t digest[CC_SHA256_DIGEST_LENGTH];
+  char digest_hex[(CC_SHA256_DIGEST_LENGTH * 2u) + 1u];
+  const char *suffix = ".vlt";
+  size_t len;
+  char *out;
+
+  CCHmac(kCCHmacAlgSHA256,
+         name_key,
+         NAME_KEY_LEN,
+         rel_path,
+         strlen(rel_path),
+         digest);
+  hex_encode(digest, sizeof(digest), digest_hex, sizeof(digest_hex));
+  len = strlen(digest_hex) + strlen(suffix) + 1u;
+  out = (char *)malloc(len);
+  if (out == NULL) {
+    fail_msg("out of memory");
+  }
+  snprintf(out, len, "%s%s", digest_hex, suffix);
+  return out;
+}
+
+static char *vault_file_path(const char *vault_dir,
+                             const char *rel_path,
+                             const uint8_t name_key[NAME_KEY_LEN]) {
+  char *basename = opaque_vault_filename(rel_path, name_key);
+  char *out = join_path(vault_dir, basename);
+
+  free(basename);
+  return out;
+}
+
+static char *legacy_vault_file_path(const char *vault_dir, const char *rel_path) {
+  const char *suffix = ".vlt";
+  char *joined = join_path(vault_dir, rel_path);
+  size_t len = strlen(joined) + strlen(suffix) + 1u;
+  char *out = (char *)malloc(len);
+
+  if (out == NULL) {
+    free(joined);
+    fail_msg("out of memory");
+  }
+  snprintf(out, len, "%s%s", joined, suffix);
+  free(joined);
+  return out;
+}
+
+static void remove_legacy_cipher_if_present(const char *vault_dir,
+                                            const char *rel_path,
+                                            const char *current_cipher_path) {
+  char *legacy_path = legacy_vault_file_path(vault_dir, rel_path);
+
+  if (strcmp(legacy_path, current_cipher_path) != 0 && path_exists(legacy_path)) {
+    if (unlink(legacy_path) != 0) {
+      free(legacy_path);
+      fail_errno("unlink legacy ciphertext");
+    }
+    remove_empty_parent_dirs_until(legacy_path, vault_dir);
+  }
+  free(legacy_path);
+}
+
+static char *restore_cipher_path(const char *vault_dir,
+                                 const char *rel_path,
+                                 const uint8_t name_key[NAME_KEY_LEN]) {
+  char *current_path = vault_file_path(vault_dir, rel_path, name_key);
+
+  if (path_exists(current_path)) {
+    return current_path;
+  }
+
+  free(current_path);
+  return legacy_vault_file_path(vault_dir, rel_path);
+}
+
+static void sha256_file_hex(const char *path, char out_hex[SHA256_HEX_LEN + 1u], uint64_t *size_out) {
+  FILE *fp = open_input_file(path);
+  CC_SHA256_CTX ctx;
+  uint8_t buf[IO_CHUNK_SIZE];
+  uint8_t digest[CC_SHA256_DIGEST_LENGTH];
+  uint64_t total = 0;
+  size_t nread;
+
+  if (CC_SHA256_Init(&ctx) != 1) {
+    fclose(fp);
+    fail_msg("sha256 init failed");
+  }
+
+  while ((nread = fread(buf, 1, sizeof(buf), fp)) > 0u) {
+    if (CC_SHA256_Update(&ctx, buf, (CC_LONG)nread) != 1) {
+      fclose(fp);
+      fail_msg("sha256 update failed");
+    }
+    total += (uint64_t)nread;
+  }
+  if (ferror(fp)) {
+    fclose(fp);
+    fail_errno(path);
+  }
+  fclose(fp);
+
+  if (CC_SHA256_Final(digest, &ctx) != 1) {
+    fail_msg("sha256 final failed");
+  }
+  hex_encode(digest, sizeof(digest), out_hex, SHA256_HEX_LEN + 1u);
+  if (size_out != NULL) {
+    *size_out = total;
+  }
+}
+
+static void manifest_init(Manifest *manifest) {
+  manifest->items = NULL;
+  manifest->len = 0u;
+  manifest->cap = 0u;
+}
+
+static void manifest_free(Manifest *manifest) {
+  size_t i;
+
+  for (i = 0; i < manifest->len; ++i) {
+    free(manifest->items[i].rel_path);
+  }
+  free(manifest->items);
+  manifest->items = NULL;
+  manifest->len = 0u;
+  manifest->cap = 0u;
+}
+
+static ManifestEntry *manifest_find(Manifest *manifest, const char *rel_path) {
+  size_t i;
+
+  for (i = 0; i < manifest->len; ++i) {
+    if (strcmp(manifest->items[i].rel_path, rel_path) == 0) {
+      return &manifest->items[i];
+    }
+  }
+  return NULL;
+}
+
+static ManifestEntry *manifest_upsert(Manifest *manifest, const char *rel_path) {
+  ManifestEntry *entry = manifest_find(manifest, rel_path);
+
+  if (entry != NULL) {
+    return entry;
+  }
+  if (manifest->len == manifest->cap) {
+    size_t new_cap = manifest->cap == 0u ? 64u : manifest->cap * 2u;
+    ManifestEntry *grown =
+        (ManifestEntry *)realloc(manifest->items, new_cap * sizeof(ManifestEntry));
+    if (grown == NULL) {
+      fail_msg("out of memory");
+    }
+    manifest->items = grown;
+    manifest->cap = new_cap;
+  }
+  entry = &manifest->items[manifest->len++];
+  entry->rel_path = xstrdup(rel_path);
+  entry->size = 0u;
+  entry->sha256_hex[0] = '\0';
+  entry->seen = 0;
+  return entry;
+}
+
+static void manifest_reset_seen(Manifest *manifest) {
+  size_t i;
+
+  for (i = 0; i < manifest->len; ++i) {
+    manifest->items[i].seen = 0;
+  }
+}
+
+static void hex_encode_string(const char *src, char **out_hex) {
+  size_t len = strlen(src);
+  char *hex = (char *)malloc((len * 2u) + 1u);
+
+  if (hex == NULL) {
+    fail_msg("out of memory");
+  }
+  hex_encode((const uint8_t *)src, len, hex, (len * 2u) + 1u);
+  *out_hex = hex;
+}
+
+static char *hex_decode_string_owned(const char *src) {
+  size_t src_len = strlen(src);
+  char *dst;
+
+  if ((src_len % 2u) != 0u) {
+    fail_msg("manifest path encoding is invalid");
+  }
+  dst = (char *)malloc((src_len / 2u) + 1u);
+  if (dst == NULL) {
+    fail_msg("out of memory");
+  }
+  hex_decode_exact(src, (uint8_t *)dst, src_len / 2u, "invalid manifest path encoding");
+  dst[src_len / 2u] = '\0';
+  return dst;
+}
+
+static void write_manifest_plaintext(const char *path, const Manifest *manifest) {
+  FILE *fp = fopen(path, "wb");
+  size_t i;
+
+  if (fp == NULL) {
+    fail_errno(path);
+  }
+  for (i = 0; i < manifest->len; ++i) {
+    char *path_hex = NULL;
+    ManifestEntry *entry = &manifest->items[i];
+
+    hex_encode_string(entry->rel_path, &path_hex);
+    fprintf(fp, "%s\t%llu\t%s\n", path_hex, (unsigned long long)entry->size, entry->sha256_hex);
+    free(path_hex);
+    if (ferror(fp)) {
+      fclose(fp);
+      fail_errno(path);
+    }
+  }
+  if (fclose(fp) != 0) {
+    fail_errno(path);
+  }
+}
+
+static void parse_manifest_plaintext(const char *path, Manifest *manifest) {
+  FILE *fp = fopen(path, "rb");
+  char *line = NULL;
+  size_t cap = 0u;
+  ssize_t line_len;
+
+  if (fp == NULL) {
+    fail_errno(path);
+  }
+
+  while ((line_len = getline(&line, &cap, fp)) >= 0) {
+    char *path_hex;
+    char *size_text;
+    char *hash_text;
+    char *path_value;
+    ManifestEntry *entry;
+    char *end = NULL;
+    unsigned long long parsed_size;
+
+    if (line_len > 0 && line[line_len - 1] == '\n') {
+      line[--line_len] = '\0';
+    }
+    path_hex = strtok(line, "\t");
+    size_text = strtok(NULL, "\t");
+    hash_text = strtok(NULL, "\t");
+    if (path_hex == NULL || size_text == NULL || hash_text == NULL || strtok(NULL, "\t") != NULL) {
+      free(line);
+      fclose(fp);
+      fail_msg("manifest file is malformed");
+    }
+    errno = 0;
+    parsed_size = strtoull(size_text, &end, 10);
+    if (errno != 0 || end == size_text || *end != '\0') {
+      free(line);
+      fclose(fp);
+      fail_msg("manifest size value is invalid");
+    }
+    if (strlen(hash_text) != SHA256_HEX_LEN) {
+      free(line);
+      fclose(fp);
+      fail_msg("manifest hash value is invalid");
+    }
+    path_value = hex_decode_string_owned(path_hex);
+    entry = manifest_upsert(manifest, path_value);
+    entry->size = (uint64_t)parsed_size;
+    memcpy(entry->sha256_hex, hash_text, SHA256_HEX_LEN + 1u);
+    entry->seen = 0;
+    free(path_value);
+  }
+
+  free(line);
+  if (ferror(fp)) {
+    fclose(fp);
+    fail_errno(path);
+  }
+  fclose(fp);
 }
 
 static void lock_memory_best_effort(void *ptr, size_t len) {
@@ -1093,6 +1538,133 @@ static char *prompt_passphrase(const char *prompt, int confirm, int require_tty)
   return result;
 }
 
+static char *keychain_default_account(void) {
+  const char *user = getenv("USER");
+
+  if (user == NULL || user[0] == '\0') {
+    fail_msg("keychain lookup requires --passphrase-keychain-account or $USER");
+  }
+  return xstrdup(user);
+}
+
+static char *shell_single_quote(const char *src) {
+  size_t len = 2u;
+  const char *p;
+  char *out;
+  char *dst;
+
+  for (p = src; *p != '\0'; ++p) {
+    len += *p == '\'' ? 4u : 1u;
+  }
+
+  out = (char *)malloc(len + 1u);
+  if (out == NULL) {
+    fail_msg("out of memory");
+  }
+
+  dst = out;
+  *dst++ = '\'';
+  for (p = src; *p != '\0'; ++p) {
+    if (*p == '\'') {
+      memcpy(dst, "'\\''", 4u);
+      dst += 4u;
+    } else {
+      *dst++ = *p;
+    }
+  }
+  *dst++ = '\'';
+  *dst = '\0';
+  return out;
+}
+
+static char *load_passphrase_from_keychain(const Options *opts) {
+  const char *service;
+  char *owned_account = NULL;
+  const char *account;
+  char *service_quoted = NULL;
+  char *account_quoted = NULL;
+  char *command = NULL;
+  FILE *fp;
+  size_t cap = 0u;
+  ssize_t line_len;
+  char *line = NULL;
+  char *result;
+
+  service = opts->keychain_service;
+  if (service == NULL || service[0] == '\0') {
+    fail_msg("keychain service name is required");
+  }
+
+  if (opts->keychain_account != NULL && opts->keychain_account[0] != '\0') {
+    account = opts->keychain_account;
+  } else {
+    owned_account = keychain_default_account();
+    account = owned_account;
+  }
+
+  service_quoted = shell_single_quote(service);
+  account_quoted = shell_single_quote(account);
+  command = (char *)malloc(strlen(service_quoted) + strlen(account_quoted) + 128u);
+  if (command == NULL) {
+    free(service_quoted);
+    free(account_quoted);
+    free(owned_account);
+    fail_msg("out of memory");
+  }
+  snprintf(command,
+           strlen(service_quoted) + strlen(account_quoted) + 128u,
+           "/usr/bin/security find-generic-password -a %s -s %s -w 2>/dev/null",
+           account_quoted,
+           service_quoted);
+  fp = popen(command, "r");
+  if (fp == NULL) {
+    free(command);
+    free(service_quoted);
+    free(account_quoted);
+    free(owned_account);
+    fail_errno("popen security");
+  }
+
+  line_len = getline(&line, &cap, fp);
+  if (pclose(fp) != 0 || line_len < 0) {
+    free(line);
+    free(command);
+    free(service_quoted);
+    free(account_quoted);
+    free(owned_account);
+    fail_msg("keychain lookup failed");
+  }
+  if (line_len > 0 && line[line_len - 1] == '\n') {
+    line[--line_len] = '\0';
+  }
+  if (line_len == 0) {
+    free(line);
+    free(command);
+    free(service_quoted);
+    free(account_quoted);
+    free(owned_account);
+    fail_msg("keychain item contained an empty passphrase");
+  }
+
+  result = xstrdup(line);
+  lock_memory_best_effort(result, strlen(result) + 1u);
+  free(line);
+  free(command);
+  free(service_quoted);
+  free(account_quoted);
+  free(owned_account);
+  return result;
+}
+
+static char *obtain_passphrase(const char *prompt, int confirm, const Options *opts) {
+  if (opts->keychain_service != NULL) {
+    (void)prompt;
+    (void)confirm;
+    return load_passphrase_from_keychain(opts);
+  }
+  return prompt_passphrase(prompt, confirm, opts->require_tty);
+}
+
 static CCCryptorRef create_ctr_cryptor(CCOperation op,
                                        const uint8_t key[ENC_KEY_LEN],
                                        const uint8_t iv[IV_LEN]) {
@@ -1233,15 +1805,17 @@ static void decrypt_ciphertext(FILE *in,
   }
 }
 
-static void encrypt_command(const char *input_path,
-                            const char *output_path,
-                            uint32_t iterations,
-                            const Options *opts) {
+static void encrypt_file_with_passphrase(const char *input_path,
+                                         const char *output_path,
+                                         uint32_t iterations,
+                                         const Options *opts,
+                                         const char *passphrase,
+                                         int require_confirm) {
   FILE *in = NULL;
   FILE *out = NULL;
   char *temp_path = NULL;
   char *owned_output = NULL;
-  char *passphrase = NULL;
+  char *owned_passphrase = NULL;
   uint8_t *prefix_bytes = NULL;
   uint8_t *recovery_source = NULL;
   size_t prefix_len = 0;
@@ -1281,7 +1855,10 @@ static void encrypt_command(const char *input_path,
     fail_msg("input and output paths must differ");
   }
 
-  passphrase = prompt_passphrase("Passphrase: ", 1, opts->require_tty);
+  if (passphrase == NULL) {
+    owned_passphrase = obtain_passphrase("Passphrase: ", require_confirm, opts);
+    passphrase = owned_passphrase;
+  }
   fill_header(&hdr, iterations, VERSION_V4);
   recovery_source = load_recovery_source(&recovery_source_len);
   prefix_bytes = build_v4_prefix(&hdr,
@@ -1355,11 +1932,21 @@ static void encrypt_command(const char *input_path,
   free(recovery_source);
   secure_release_buffer(enc_key, sizeof(enc_key));
   secure_release_buffer(mac_key, sizeof(mac_key));
-  secure_free_string(&passphrase);
+  secure_free_string(&owned_passphrase);
   free(owned_output);
 }
 
-static void decrypt_command(const char *input_path, const char *output_path, const Options *opts) {
+static void encrypt_command(const char *input_path,
+                            const char *output_path,
+                            uint32_t iterations,
+                            const Options *opts) {
+  encrypt_file_with_passphrase(input_path, output_path, iterations, opts, NULL, 1);
+}
+
+static void decrypt_file_with_passphrase(const char *input_path,
+                                         const char *output_path,
+                                         const Options *opts,
+                                         const char *passphrase) {
   FILE *in;
   FILE *out;
   char *temp_path = NULL;
@@ -1370,7 +1957,7 @@ static void decrypt_command(const char *input_path, const char *output_path, con
   size_t metadata_len = 0;
   uint8_t enc_key[ENC_KEY_LEN];
   uint8_t mac_key[MAC_KEY_LEN];
-  char *passphrase = NULL;
+  char *owned_passphrase = NULL;
   VaultFormat format;
   VaultHeader hdr;
   VaultHeaderV4Info v4info;
@@ -1427,7 +2014,10 @@ static void decrypt_command(const char *input_path, const char *output_path, con
   }
   ciphertext_len = total_size - prefix_len - TAG_LEN;
 
-  passphrase = prompt_passphrase("Passphrase: ", 0, opts->require_tty);
+  if (passphrase == NULL) {
+    owned_passphrase = obtain_passphrase("Passphrase: ", 0, opts);
+    passphrase = owned_passphrase;
+  }
   derive_keys(passphrase, hdr.salt, hdr.iterations, enc_key, mac_key);
   lock_memory_best_effort(enc_key, sizeof(enc_key));
   lock_memory_best_effort(mac_key, sizeof(mac_key));
@@ -1470,6 +2060,326 @@ static void decrypt_command(const char *input_path, const char *output_path, con
   }
   secure_release_buffer(enc_key, sizeof(enc_key));
   secure_release_buffer(mac_key, sizeof(mac_key));
+  secure_free_string(&owned_passphrase);
+}
+
+static void decrypt_command(const char *input_path, const char *output_path, const Options *opts) {
+  decrypt_file_with_passphrase(input_path, output_path, opts, NULL);
+}
+
+static char *make_manifest_temp_path(const char *vault_dir) {
+  return join_path(vault_dir, ".vaultcrypt-manifest.plain.tmp");
+}
+
+static void load_manifest_if_present(const char *vault_dir,
+                                     const Options *opts,
+                                     const char *passphrase,
+                                     Manifest *manifest) {
+  char *cipher_path = manifest_path(vault_dir);
+
+  if (path_exists(cipher_path)) {
+    char *plain_path = make_manifest_temp_path(vault_dir);
+
+    decrypt_file_with_passphrase(cipher_path, plain_path, opts, passphrase);
+    parse_manifest_plaintext(plain_path, manifest);
+    if (unlink(plain_path) != 0) {
+      free(plain_path);
+      free(cipher_path);
+      fail_errno("unlink manifest temp");
+    }
+    free(plain_path);
+  }
+  free(cipher_path);
+}
+
+static void store_manifest(const char *vault_dir,
+                           const Options *opts,
+                           const char *passphrase,
+                           uint32_t iterations,
+                           const Manifest *manifest) {
+  char *plain_path = make_manifest_temp_path(vault_dir);
+  char *cipher_path = manifest_path(vault_dir);
+  Options local_opts = *opts;
+
+  write_manifest_plaintext(plain_path, manifest);
+  local_opts.force = 1;
+  encrypt_file_with_passphrase(plain_path, cipher_path, iterations, &local_opts, passphrase, 0);
+  if (unlink(plain_path) != 0) {
+    free(plain_path);
+    free(cipher_path);
+    fail_errno("unlink manifest temp");
+  }
+  free(plain_path);
+  free(cipher_path);
+}
+
+static void remove_manifest_index(Manifest *manifest, size_t index) {
+  size_t i;
+
+  free(manifest->items[index].rel_path);
+  for (i = index + 1u; i < manifest->len; ++i) {
+    manifest->items[i - 1u] = manifest->items[i];
+  }
+  manifest->len--;
+}
+
+static void syncdir_walk(const char *source_dir,
+                         const char *vault_dir,
+                         const char *rel_path,
+                         const uint8_t name_key[NAME_KEY_LEN],
+                         const Options *opts,
+                         const char *passphrase,
+                         uint32_t iterations,
+                         Manifest *manifest,
+                         size_t *encrypted_count,
+                         size_t *skipped_count) {
+  char *dir_path = rel_path[0] == '\0' ? xstrdup(source_dir) : join_path(source_dir, rel_path);
+  DIR *dir = opendir(dir_path);
+  struct dirent *entry;
+
+  if (dir == NULL) {
+    free(dir_path);
+    fail_errno("opendir");
+  }
+
+  while ((entry = readdir(dir)) != NULL) {
+    char *child_rel;
+    char *source_path;
+    struct stat st;
+
+    if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
+      continue;
+    }
+
+    if (rel_path[0] == '\0') {
+      child_rel = xstrdup(entry->d_name);
+    } else {
+      char *prefix = join_path(rel_path, entry->d_name);
+      child_rel = prefix;
+    }
+    source_path = join_path(source_dir, child_rel);
+    if (lstat(source_path, &st) != 0) {
+      const int saved_errno = errno;
+      free(child_rel);
+      closedir(dir);
+      free(dir_path);
+      fprintf(stderr, "vaultcrypt: lstat failed: %s: %s\n", source_path, strerror(saved_errno));
+      free(source_path);
+      exit(1);
+    }
+
+    if (S_ISDIR(st.st_mode)) {
+      syncdir_walk(source_dir,
+                   vault_dir,
+                   child_rel,
+                   name_key,
+                   opts,
+                   passphrase,
+                   iterations,
+                   manifest,
+                   encrypted_count,
+                   skipped_count);
+      free(child_rel);
+      free(source_path);
+      continue;
+    }
+
+    if (S_ISREG(st.st_mode)) {
+      ManifestEntry *manifest_entry;
+      char sha256_hex[SHA256_HEX_LEN + 1u];
+      uint64_t size = 0;
+      char *cipher_path = vault_file_path(vault_dir, child_rel, name_key);
+      int needs_encrypt = 1;
+
+      sha256_file_hex(source_path, sha256_hex, &size);
+      manifest_entry = manifest_upsert(manifest, child_rel);
+      manifest_entry->seen = 1;
+
+      if (path_exists(cipher_path) &&
+          manifest_entry->size == size &&
+          strcmp(manifest_entry->sha256_hex, sha256_hex) == 0) {
+        needs_encrypt = 0;
+      }
+
+      if (needs_encrypt) {
+        Options local_opts = *opts;
+        local_opts.force = 1;
+        ensure_parent_dir(cipher_path);
+        encrypt_file_with_passphrase(source_path,
+                                     cipher_path,
+                                     iterations,
+                                     &local_opts,
+                                     passphrase,
+                                     0);
+        (*encrypted_count)++;
+      } else {
+        (*skipped_count)++;
+      }
+
+      manifest_entry->size = size;
+      memcpy(manifest_entry->sha256_hex, sha256_hex, sizeof(sha256_hex));
+      remove_legacy_cipher_if_present(vault_dir, child_rel, cipher_path);
+
+      free(cipher_path);
+      free(child_rel);
+      free(source_path);
+      continue;
+    }
+
+    free(child_rel);
+    free(source_path);
+  }
+
+  if (closedir(dir) != 0) {
+    free(dir_path);
+    fail_errno("closedir");
+  }
+  free(dir_path);
+}
+
+static void prune_removed_entries(const char *vault_dir,
+                                  const uint8_t name_key[NAME_KEY_LEN],
+                                  Manifest *manifest,
+                                  size_t *removed_count) {
+  size_t i = 0u;
+
+  while (i < manifest->len) {
+    ManifestEntry *entry = &manifest->items[i];
+
+    if (entry->seen) {
+      ++i;
+      continue;
+    }
+
+    {
+      char *cipher_path = vault_file_path(vault_dir, entry->rel_path, name_key);
+      if (path_exists(cipher_path) && unlink(cipher_path) != 0) {
+        free(cipher_path);
+        fail_errno("unlink stale ciphertext");
+      }
+      remove_legacy_cipher_if_present(vault_dir, entry->rel_path, cipher_path);
+      free(cipher_path);
+    }
+    remove_manifest_index(manifest, i);
+    (*removed_count)++;
+  }
+}
+
+static void syncdir_command(const char *source_dir,
+                            const char *vault_dir,
+                            uint32_t iterations,
+                            const Options *opts) {
+  Manifest manifest;
+  char *passphrase;
+  uint8_t name_key[NAME_KEY_LEN];
+  size_t encrypted_count = 0u;
+  size_t skipped_count = 0u;
+  size_t removed_count = 0u;
+
+  if (source_dir == NULL || vault_dir == NULL) {
+    usage(stderr, 2);
+  }
+  require_directory(source_dir, "syncdir input must be a directory");
+  ensure_dir_recursive(vault_dir);
+  require_directory(vault_dir, "syncdir output must be a directory");
+  if (iterations < MIN_ITERATIONS) {
+    fail_msg("iteration count is too low");
+  }
+
+  manifest_init(&manifest);
+  passphrase = obtain_passphrase("Passphrase: ", 1, opts);
+  derive_name_key(passphrase, name_key);
+  load_manifest_if_present(vault_dir, opts, passphrase, &manifest);
+  manifest_reset_seen(&manifest);
+  syncdir_walk(source_dir,
+               vault_dir,
+               "",
+               name_key,
+               opts,
+               passphrase,
+               iterations,
+               &manifest,
+               &encrypted_count,
+               &skipped_count);
+  prune_removed_entries(vault_dir, name_key, &manifest, &removed_count);
+  store_manifest(vault_dir, opts, passphrase, iterations, &manifest);
+  printf("syncdir: encrypted=%zu skipped=%zu removed=%zu\n",
+         encrypted_count,
+         skipped_count,
+         removed_count);
+  manifest_free(&manifest);
+  secure_release_buffer(name_key, sizeof(name_key));
+  secure_free_string(&passphrase);
+}
+
+static void restoredir_command(const char *vault_dir, const char *output_dir, const Options *opts) {
+  Manifest manifest;
+  char *passphrase;
+  uint8_t name_key[NAME_KEY_LEN];
+  size_t restored_count = 0u;
+  size_t skipped_count = 0u;
+  size_t i;
+
+  if (vault_dir == NULL || output_dir == NULL) {
+    usage(stderr, 2);
+  }
+  require_directory(vault_dir, "restoredir input must be a directory");
+  ensure_dir_recursive(output_dir);
+  require_directory(output_dir, "restoredir output must be a directory");
+
+  manifest_init(&manifest);
+  passphrase = obtain_passphrase("Passphrase: ", 0, opts);
+  derive_name_key(passphrase, name_key);
+  load_manifest_if_present(vault_dir, opts, passphrase, &manifest);
+  if (manifest.len == 0u) {
+    manifest_free(&manifest);
+    secure_release_buffer(name_key, sizeof(name_key));
+    secure_free_string(&passphrase);
+    fail_msg("manifest is missing or empty");
+  }
+
+  for (i = 0; i < manifest.len; ++i) {
+    ManifestEntry *entry = &manifest.items[i];
+    char existing_sha256[SHA256_HEX_LEN + 1u];
+    uint64_t existing_size = 0u;
+    char *cipher_path = restore_cipher_path(vault_dir, entry->rel_path, name_key);
+    char *output_path = join_path(output_dir, entry->rel_path);
+    int needs_restore = 1;
+    Options local_opts = *opts;
+
+    if (!path_exists(cipher_path)) {
+      free(cipher_path);
+      free(output_path);
+      manifest_free(&manifest);
+      secure_release_buffer(name_key, sizeof(name_key));
+      secure_free_string(&passphrase);
+      fail_msg("ciphertext file listed in manifest is missing");
+    }
+
+    if (path_exists(output_path)) {
+      sha256_file_hex(output_path, existing_sha256, &existing_size);
+      if (existing_size == entry->size &&
+          strcmp(existing_sha256, entry->sha256_hex) == 0) {
+        needs_restore = 0;
+      }
+    }
+
+    if (needs_restore) {
+      local_opts.force = 1;
+      ensure_parent_dir(output_path);
+      decrypt_file_with_passphrase(cipher_path, output_path, &local_opts, passphrase);
+      restored_count++;
+    } else {
+      skipped_count++;
+    }
+
+    free(cipher_path);
+    free(output_path);
+  }
+
+  printf("restoredir: restored=%zu skipped=%zu\n", restored_count, skipped_count);
+  manifest_free(&manifest);
+  secure_release_buffer(name_key, sizeof(name_key));
   secure_free_string(&passphrase);
 }
 
@@ -1738,7 +2648,7 @@ int main(int argc, char **argv) {
   const char *input_path = NULL;
   const char *output_path = NULL;
   uint32_t iterations = DEFAULT_ITERATIONS;
-  Options opts = {0, 0, 1, 0};
+  Options opts = {0, 0, 1, 0, NULL, NULL};
   int i;
   char *end = NULL;
   unsigned long parsed;
@@ -1784,6 +2694,16 @@ int main(int argc, char **argv) {
       opts.info_json = 1;
     } else if (strcmp(argv[i], "--no-tty") == 0) {
       opts.require_tty = 0;
+    } else if (strcmp(argv[i], "--passphrase-keychain-service") == 0) {
+      if (++i >= argc) {
+        usage(stderr, 2);
+      }
+      opts.keychain_service = argv[i];
+    } else if (strcmp(argv[i], "--passphrase-keychain-account") == 0) {
+      if (++i >= argc) {
+        usage(stderr, 2);
+      }
+      opts.keychain_account = argv[i];
     } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
       usage(stdout, 0);
     } else {
@@ -1804,6 +2724,14 @@ int main(int argc, char **argv) {
   }
   if (strcmp(command, "info") == 0) {
     info_command(input_path, &opts);
+    return 0;
+  }
+  if (strcmp(command, "syncdir") == 0) {
+    syncdir_command(input_path, output_path, iterations, &opts);
+    return 0;
+  }
+  if (strcmp(command, "restoredir") == 0) {
+    restoredir_command(input_path, output_path, &opts);
     return 0;
   }
   if (strcmp(command, "selftest") == 0) {
