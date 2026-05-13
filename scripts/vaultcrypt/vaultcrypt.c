@@ -9,9 +9,11 @@
 #include <CommonCrypto/CommonKeyDerivation.h>
 #include <CommonCrypto/CommonRandom.h>
 #include <dirent.h>
+#include <dispatch/dispatch.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <fnmatch.h>
+#include <pthread.h>
 #include <readpassphrase.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -86,8 +88,10 @@
 
 #define VERSION_V3 3u
 #define VERSION_V4 4u
+#define VERSION_V5 5u
 
 #define KDF_ID_PBKDF2_SHA256 1u
+#define KDF_ID_SESSION_HMAC_SHA256 2u
 #define CIPHER_ID_AES256_CTR 1u
 #define MAC_ID_HMAC_SHA256_ETM 1u
 
@@ -1133,6 +1137,15 @@ static void derive_keys(const char *passphrase,
   secure_bzero(derived, sizeof(derived));
 }
 
+static void derive_session_keys(const uint8_t master_enc[ENC_KEY_LEN],
+                               const uint8_t master_mac[MAC_KEY_LEN],
+                               const uint8_t salt[SALT_LEN],
+                               uint8_t out_enc[ENC_KEY_LEN],
+                               uint8_t out_mac[MAC_KEY_LEN]) {
+  CCHmac(kCCHmacAlgSHA256, master_enc, ENC_KEY_LEN, salt, SALT_LEN, out_enc);
+  CCHmac(kCCHmacAlgSHA256, master_mac, MAC_KEY_LEN, salt, SALT_LEN, out_mac);
+}
+
 static void fill_header(VaultHeader *hdr, uint32_t iterations, uint32_t version) {
   hdr->version = version;
   hdr->kdf_id = KDF_ID_PBKDF2_SHA256;
@@ -1327,8 +1340,8 @@ static VaultFormat detect_format(const uint8_t magic[MAGIC_LEN]) {
 }
 
 static void validate_header_common(const VaultHeader *hdr) {
-  if ((hdr->version != VERSION_V3 && hdr->version != VERSION_V4) ||
-      hdr->kdf_id != KDF_ID_PBKDF2_SHA256 ||
+  if ((hdr->version != VERSION_V3 && hdr->version != VERSION_V4 && hdr->version != VERSION_V5) ||
+      (hdr->kdf_id != KDF_ID_PBKDF2_SHA256 && hdr->kdf_id != KDF_ID_SESSION_HMAC_SHA256) ||
       hdr->cipher_id != CIPHER_ID_AES256_CTR ||
       hdr->mac_id != MAC_ID_HMAC_SHA256_ETM) {
     fail_msg("unsupported vaultcrypt parameters");
@@ -1922,17 +1935,36 @@ static void decrypt_ciphertext(FILE *in,
   }
 }
 
-static void encrypt_file_with_passphrase(const char *input_path,
-                                         const char *output_path,
-                                         uint32_t iterations,
-                                         const Options *opts,
-                                         const char *passphrase,
-                                         int require_confirm) {
+static void print_recovery_key(const VaultHeader *hdr, const uint8_t enc_key[ENC_KEY_LEN], const uint8_t mac_key[MAC_KEY_LEN]) {
+  uint8_t combined[DERIVED_KEY_LEN];
+  char *b64;
+  size_t b64_len;
+
+  memcpy(combined, enc_key, ENC_KEY_LEN);
+  memcpy(combined + ENC_KEY_LEN, mac_key, MAC_KEY_LEN);
+
+  b64 = base64_encode_wrapped(combined, sizeof(combined), &b64_len);
+  printf("\n===BEGIN-RECOVERY-KEY===\n");
+  printf("Version: %u\n", hdr->version);
+  printf("Iterations: %u\n", hdr->iterations);
+  printf("Key: %s\n", b64);
+  printf("===END-RECOVERY-KEY===\n\n");
+
+  free(b64);
+  secure_bzero(combined, sizeof(combined));
+}
+
+static void encrypt_file_with_session_keys(const char *input_path,
+                                          const char *output_path,
+                                          uint32_t iterations,
+                                          const Options *opts,
+                                          const uint8_t master_enc[ENC_KEY_LEN],
+                                          const uint8_t master_mac[MAC_KEY_LEN],
+                                          int is_recovery) {
   FILE *in = NULL;
   FILE *out = NULL;
   char *temp_path = NULL;
   char *owned_output = NULL;
-  char *owned_passphrase = NULL;
   uint8_t *prefix_bytes = NULL;
   uint8_t *recovery_source = NULL;
   size_t prefix_len = 0;
@@ -1951,47 +1983,22 @@ static void encrypt_file_with_passphrase(const char *input_path,
   memset(mac_key, 0, sizeof(mac_key));
   memset(tag, 0, sizeof(tag));
 
-  if (input_path == NULL) {
-    usage(stderr, 2);
-  }
-  if (iterations < MIN_ITERATIONS) {
-    fail_msg("iteration count is too low");
-  }
-
+  if (input_path == NULL) usage(stderr, 2);
   if (output_path == NULL) {
-    if (strcmp(input_path, "-") == 0) {
-      fail_msg("encrypting from stdin requires -o OUTPUT");
-    }
     owned_output = default_encrypt_output(input_path);
     output_path = owned_output;
   }
-  if (strcmp(output_path, "-") == 0) {
-    fail_msg("encrypt requires a file output path");
-  }
-  if (strcmp(input_path, "-") != 0 && strcmp(input_path, output_path) == 0) {
-    fail_msg("input and output paths must differ");
-  }
+  
+  fill_header(&hdr, iterations, VERSION_V5);
+  hdr.kdf_id = KDF_ID_SESSION_HMAC_SHA256;
+  derive_session_keys(master_enc, master_mac, hdr.salt, enc_key, mac_key);
 
-  if (passphrase == NULL) {
-    owned_passphrase = obtain_passphrase("Passphrase: ", require_confirm, opts);
-    passphrase = owned_passphrase;
-  }
-  fill_header(&hdr, iterations, VERSION_V4);
   recovery_source = load_recovery_source(&recovery_source_len);
-  prefix_bytes = build_v4_prefix(&hdr,
-                                 recovery_source,
-                                 recovery_source_len,
-                                 &prefix_len,
-                                 &metadata_len);
-  derive_keys(passphrase, hdr.salt, hdr.iterations, enc_key, mac_key);
-  lock_memory_best_effort(enc_key, sizeof(enc_key));
-  lock_memory_best_effort(mac_key, sizeof(mac_key));
+  prefix_bytes = build_v4_prefix(&hdr, recovery_source, recovery_source_len, &prefix_len, &metadata_len);
 
-  if (strcmp(input_path, "-") == 0) {
-    in = stdin;
-  } else {
-    in = open_input_file(input_path);
-  }
+  if (strcmp(input_path, "-") == 0) in = stdin;
+  else in = open_input_file(input_path);
+  
   out = open_output_temp(output_path, &temp_path, opts->force);
 
   write_exact(out, prefix_bytes, prefix_len, "write header");
@@ -2002,55 +2009,47 @@ static void encrypt_file_with_passphrase(const char *input_path,
   for (;;) {
     size_t nread = fread(inbuf, 1, sizeof(inbuf), in);
     size_t produced = 0;
-    CCCryptorStatus status;
-
     if (nread == 0u) {
-      if (ferror(in)) {
-        CCCryptorRelease(cryptor);
-        fail_errno("read input");
-      }
+      if (ferror(in)) { CCCryptorRelease(cryptor); fail_errno("read input"); }
       break;
     }
-
-    status = CCCryptorUpdate(cryptor,
-                             inbuf,
-                             nread,
-                             outbuf,
-                             sizeof(outbuf),
-                             &produced);
-    if (status != kCCSuccess || produced != nread) {
-      CCCryptorRelease(cryptor);
-      fail_msg("encryption failed");
-    }
-
+    CCCryptorUpdate(cryptor, inbuf, nread, outbuf, sizeof(outbuf), &produced);
     CCHmacUpdate(&hmac, outbuf, produced);
     write_exact(out, outbuf, produced, "write ciphertext");
   }
-  {
-    size_t produced = 0;
-    CCCryptorStatus status = CCCryptorFinal(cryptor,
-                                            outbuf,
-                                            sizeof(outbuf),
-                                            &produced);
-    CCCryptorRelease(cryptor);
-    if (status != kCCSuccess || produced != 0u) {
-      fail_msg("final encryption step failed");
-    }
-  }
-
+  CCCryptorRelease(cryptor);
   CCHmacFinal(&hmac, tag);
   write_exact(out, tag, sizeof(tag), "write tag");
-  finalize_output_file(out, temp_path, output_path);
 
-  if (in != NULL && in != stdin) {
-    fclose(in);
-  }
+  finalize_output_file(out, temp_path, output_path);
+  if (in != stdin) fclose(in);
   free(prefix_bytes);
   free(recovery_source);
-  secure_release_buffer(enc_key, sizeof(enc_key));
-  secure_release_buffer(mac_key, sizeof(mac_key));
-  secure_free_string(&owned_passphrase);
-  free(owned_output);
+  if (owned_output) free(owned_output);
+  if (is_recovery) print_recovery_key(&hdr, enc_key, mac_key);
+}
+
+static void encrypt_file_with_passphrase(const char *input_path,
+                                         const char *output_path,
+                                         uint32_t iterations,
+                                         const Options *opts,
+                                         const char *passphrase,
+                                         int require_confirm) {
+  uint8_t m_enc[ENC_KEY_LEN], m_mac[MAC_KEY_LEN];
+  uint8_t s_salt[SALT_LEN] = "v5-session-salt";
+  char *owned_passphrase = NULL;
+
+  if (passphrase == NULL) {
+    owned_passphrase = obtain_passphrase("Passphrase: ", require_confirm, opts);
+    passphrase = owned_passphrase;
+  }
+
+  derive_keys(passphrase, s_salt, iterations, m_enc, m_mac);
+  encrypt_file_with_session_keys(input_path, output_path, iterations, opts, m_enc, m_mac, 0);
+  
+  secure_release_buffer(m_enc, sizeof(m_enc));
+  secure_release_buffer(m_mac, sizeof(m_mac));
+  if (owned_passphrase) secure_free_string(&owned_passphrase);
 }
 
 static void encrypt_command(const char *input_path,
@@ -2135,7 +2134,19 @@ static void decrypt_file_with_passphrase(const char *input_path,
     owned_passphrase = obtain_passphrase("Passphrase: ", 0, opts);
     passphrase = owned_passphrase;
   }
-  derive_keys(passphrase, hdr.salt, hdr.iterations, enc_key, mac_key);
+
+  if (hdr.kdf_id == KDF_ID_PBKDF2_SHA256) {
+    derive_keys(passphrase, hdr.salt, hdr.iterations, enc_key, mac_key);
+  } else if (hdr.kdf_id == KDF_ID_SESSION_HMAC_SHA256) {
+    uint8_t m_enc[ENC_KEY_LEN], m_mac[MAC_KEY_LEN];
+    uint8_t s_salt[SALT_LEN] = "v5-session-salt";
+    derive_keys(passphrase, s_salt, hdr.iterations, m_enc, m_mac);
+    derive_session_keys(m_enc, m_mac, hdr.salt, enc_key, mac_key);
+    secure_release_buffer(m_enc, sizeof(m_enc));
+    secure_release_buffer(m_mac, sizeof(m_mac));
+  } else {
+    fail_msg("unsupported KDF ID");
+  }
   lock_memory_best_effort(enc_key, sizeof(enc_key));
   lock_memory_best_effort(mac_key, sizeof(mac_key));
 
@@ -2240,17 +2251,56 @@ static void remove_manifest_index(Manifest *manifest, size_t index) {
   manifest->len--;
 }
 
-static void syncdir_walk(const char *source_dir,
-                         const char *vault_dir,
-                         const char *rel_path,
-                         const uint8_t name_key[NAME_KEY_LEN],
-                         const Options *opts,
-                         const char *passphrase,
-                         uint32_t iterations,
-                         Manifest *manifest,
-                         size_t *encrypted_count,
-                         size_t *skipped_count) {
-  char *dir_path = rel_path[0] == '\0' ? xstrdup(source_dir) : join_path(source_dir, rel_path);
+typedef struct {
+  char *source_path;
+  char *cipher_path;
+  char *rel_path;
+  struct stat st;
+} SyncTask;
+
+typedef struct {
+  SyncTask *tasks;
+  size_t len;
+  size_t cap;
+} SyncTaskList;
+
+static void task_list_init(SyncTaskList *list) {
+  list->tasks = NULL;
+  list->len = list->cap = 0;
+}
+
+static void task_list_add(SyncTaskList *list, const char *source_path, const char *cipher_path, const char *rel_path, struct stat st) {
+  if (list->len >= list->cap) {
+    list->cap = list->cap == 0 ? 64 : list->cap * 2;
+    list->tasks = (SyncTask *)realloc(list->tasks, list->cap * sizeof(SyncTask));
+    if (!list->tasks) fail_msg("out of memory");
+  }
+  SyncTask *t = &list->tasks[list->len++];
+  t->source_path = xstrdup(source_path);
+  t->cipher_path = xstrdup(cipher_path);
+  t->rel_path = xstrdup(rel_path);
+  t->st = st;
+}
+
+static void task_list_free(SyncTaskList *list) {
+  for (size_t i = 0; i < list->len; i++) {
+    free(list->tasks[i].source_path);
+    free(list->tasks[i].cipher_path);
+    free(list->tasks[i].rel_path);
+  }
+  free(list->tasks);
+}
+
+typedef struct {
+  const char *source_dir;
+  const char *vault_dir;
+  const uint8_t *name_key;
+  const Options *opts;
+  SyncTaskList *tasks;
+} WalkContext;
+
+static void syncdir_collect_tasks(const char *rel_path, WalkContext *ctx) {
+  char *dir_path = rel_path[0] == '\0' ? xstrdup(ctx->source_dir) : join_path(ctx->source_dir, rel_path);
   DIR *dir = opendir(dir_path);
   struct dirent *entry;
 
@@ -2271,106 +2321,110 @@ static void syncdir_walk(const char *source_dir,
     if (rel_path[0] == '\0') {
       child_rel = xstrdup(entry->d_name);
     } else {
-      char *prefix = join_path(rel_path, entry->d_name);
-      child_rel = prefix;
+      child_rel = join_path(rel_path, entry->d_name);
     }
-    source_path = join_path(source_dir, child_rel);
+    source_path = join_path(ctx->source_dir, child_rel);
     if (lstat(source_path, &st) != 0) {
-      const int saved_errno = errno;
-      free(child_rel);
-      closedir(dir);
-      free(dir_path);
-      fprintf(stderr, "vaultcrypt: lstat failed: %s: %s\n", source_path, strerror(saved_errno));
-      free(source_path);
-      exit(1);
+      fail_errno("lstat");
     }
 
-    if (is_excluded(child_rel, opts)) {
-      if (opts->dry_run) printf("[DRY-RUN] Skipping excluded: %s\n", child_rel);
+    if (is_excluded(child_rel, ctx->opts)) {
+      if (ctx->opts->dry_run) printf("[DRY-RUN] Skipping excluded: %s\n", child_rel);
       free(child_rel);
       free(source_path);
       continue;
     }
 
     if (S_ISDIR(st.st_mode)) {
-      syncdir_walk(source_dir,
-                   vault_dir,
-                   child_rel,
-                   name_key,
-                   opts,
-                   passphrase,
-                   iterations,
-                   manifest,
-                   encrypted_count,
-                   skipped_count);
+      syncdir_collect_tasks(child_rel, ctx);
       free(child_rel);
       free(source_path);
       continue;
     }
 
     if (S_ISREG(st.st_mode)) {
-      ManifestEntry *manifest_entry;
-      char sha256_hex[SHA256_HEX_LEN + 1u];
-      uint64_t size = 0;
-      char *cipher_path = vault_file_path(vault_dir, child_rel, name_key);
-      int needs_encrypt = 1;
-
-      manifest_entry = manifest_upsert(manifest, child_rel);
-      manifest_entry->seen = 1;
-
-      if (opts->fast_sync && path_exists(cipher_path) &&
-          manifest_entry->size == (uint64_t)st.st_size &&
-          manifest_entry->mtime == (uint64_t)st.st_mtime) {
-          needs_encrypt = 0;
-      } else {
-          sha256_file_hex(source_path, sha256_hex, &size);
-          if (path_exists(cipher_path) &&
-              manifest_entry->size == size &&
-              strcmp(manifest_entry->sha256_hex, sha256_hex) == 0) {
-            needs_encrypt = 0;
-          }
-          manifest_entry->size = size;
-          manifest_entry->mtime = (uint64_t)st.st_mtime;
-          memcpy(manifest_entry->sha256_hex, sha256_hex, sizeof(sha256_hex));
-      }
-
-      if (needs_encrypt) {
-        if (opts->dry_run) {
-            printf("[DRY-RUN] Would encrypt: %s\n", child_rel);
-            (*encrypted_count)++;
-        } else {
-          Options local_opts = *opts;
-          local_opts.force = 1;
-          ensure_parent_dir(cipher_path);
-          encrypt_file_with_passphrase(source_path,
-                                       cipher_path,
-                                       iterations,
-                                       &local_opts,
-                                       passphrase,
-                                       0);
-          (*encrypted_count)++;
-        }
-      } else {
-        (*skipped_count)++;
-      }
-
-      remove_legacy_cipher_if_present(vault_dir, child_rel, cipher_path);
-
+      char *cipher_path = vault_file_path(ctx->vault_dir, child_rel, ctx->name_key);
+      task_list_add(ctx->tasks, source_path, cipher_path, child_rel, st);
       free(cipher_path);
-      free(child_rel);
-      free(source_path);
-      continue;
     }
 
     free(child_rel);
     free(source_path);
   }
-
-  if (closedir(dir) != 0) {
-    free(dir_path);
-    fail_errno("closedir");
-  }
+  closedir(dir);
   free(dir_path);
+}
+
+typedef struct {
+  const char *passphrase;
+  uint32_t iterations;
+  uint8_t master_enc[ENC_KEY_LEN];
+  uint8_t master_mac[MAC_KEY_LEN];
+  Manifest *manifest;
+  pthread_mutex_t manifest_mutex;
+  const Options *opts;
+  const char *vault_dir;
+  size_t encrypted_count;
+  size_t skipped_count;
+} ParallelContext;
+
+static void syncdir_process_task(SyncTask *task, ParallelContext *ctx) {
+  ManifestEntry *manifest_entry;
+  char sha256_hex[SHA256_HEX_LEN + 1u];
+  uint64_t size = 0;
+  int needs_encrypt = 1;
+
+  pthread_mutex_lock(&ctx->manifest_mutex);
+  manifest_entry = manifest_upsert(ctx->manifest, task->rel_path);
+  manifest_entry->seen = 1;
+  uint64_t m_size = manifest_entry->size;
+  uint64_t m_mtime = manifest_entry->mtime;
+  char m_sha256[SHA256_HEX_LEN + 1u];
+  memcpy(m_sha256, manifest_entry->sha256_hex, sizeof(m_sha256));
+  pthread_mutex_unlock(&ctx->manifest_mutex);
+
+  if (ctx->opts->fast_sync && path_exists(task->cipher_path) &&
+      m_size == (uint64_t)task->st.st_size &&
+      m_mtime == (uint64_t)task->st.st_mtime) {
+      needs_encrypt = 0;
+  } else {
+      sha256_file_hex(task->source_path, sha256_hex, &size);
+      if (path_exists(task->cipher_path) &&
+          m_size == size &&
+          strcmp(m_sha256, sha256_hex) == 0) {
+        needs_encrypt = 0;
+      }
+      
+      pthread_mutex_lock(&ctx->manifest_mutex);
+      manifest_entry = manifest_upsert(ctx->manifest, task->rel_path);
+      manifest_entry->size = size;
+      manifest_entry->mtime = (uint64_t)task->st.st_mtime;
+      memcpy(manifest_entry->sha256_hex, sha256_hex, sizeof(sha256_hex));
+      pthread_mutex_unlock(&ctx->manifest_mutex);
+  }
+
+  if (needs_encrypt) {
+    if (ctx->opts->dry_run) {
+        printf("[DRY-RUN] Would encrypt: %s\n", task->rel_path);
+        __sync_fetch_and_add(&ctx->encrypted_count, 1);
+    } else {
+      Options local_opts = *(ctx->opts);
+      local_opts.force = 1;
+      ensure_parent_dir(task->cipher_path);
+      encrypt_file_with_session_keys(task->source_path,
+                                     task->cipher_path,
+                                     ctx->iterations,
+                                     &local_opts,
+                                     ctx->master_enc,
+                                     ctx->master_mac,
+                                     0);
+      __sync_fetch_and_add(&ctx->encrypted_count, 1);
+    }
+  } else {
+    __sync_fetch_and_add(&ctx->skipped_count, 1);
+  }
+
+  remove_legacy_cipher_if_present(ctx->vault_dir, task->rel_path, task->cipher_path);
 }
 
 static void prune_removed_entries(const char *vault_dir,
@@ -2433,16 +2487,33 @@ static void syncdir_command(const char *source_dir,
   derive_name_key(passphrase, name_key);
   load_manifest_if_present(vault_dir, &local_opts, passphrase, &manifest);
   manifest_reset_seen(&manifest);
-  syncdir_walk(source_dir,
-               vault_dir,
-               "",
-               name_key,
-               &local_opts,
-               passphrase,
-               local_opts.iterations,
-               &manifest,
-               &encrypted_count,
-               &skipped_count);
+
+  SyncTaskList task_list;
+  task_list_init(&task_list);
+  WalkContext walk_ctx = {source_dir, vault_dir, name_key, &local_opts, &task_list};
+  syncdir_collect_tasks("", &walk_ctx);
+
+  ParallelContext p_ctx = {0};
+  p_ctx.passphrase = passphrase;
+  p_ctx.iterations = local_opts.iterations;
+  p_ctx.manifest = &manifest;
+  p_ctx.opts = &local_opts;
+  p_ctx.vault_dir = vault_dir;
+  
+  uint8_t session_salt[SALT_LEN] = "vaultcrypt-v5-session-salt-v1";
+  derive_keys(passphrase, session_salt, local_opts.iterations, p_ctx.master_enc, p_ctx.master_mac);
+  
+  pthread_mutex_init(&p_ctx.manifest_mutex, NULL);
+
+  dispatch_apply(task_list.len, DISPATCH_APPLY_AUTO, ^(size_t i) {
+    syncdir_process_task(&task_list.tasks[i], &p_ctx);
+  });
+  
+  secure_release_buffer(p_ctx.master_enc, sizeof(p_ctx.master_enc));
+  secure_release_buffer(p_ctx.master_mac, sizeof(p_ctx.master_mac));
+
+  encrypted_count = p_ctx.encrypted_count;
+  skipped_count = p_ctx.skipped_count;
 
   if (local_opts.dry_run) {
     printf("[DRY-RUN] Would prune removed entries and store manifest...\n");
@@ -2450,6 +2521,9 @@ static void syncdir_command(const char *source_dir,
     prune_removed_entries(vault_dir, name_key, &manifest, &removed_count);
     store_manifest(vault_dir, &local_opts, passphrase, local_opts.iterations, &manifest);
   }
+
+  task_list_free(&task_list);
+  pthread_mutex_destroy(&p_ctx.manifest_mutex);
 
   printf("syncdir: encrypted=%zu skipped=%zu removed=%zu\n",
          encrypted_count,
