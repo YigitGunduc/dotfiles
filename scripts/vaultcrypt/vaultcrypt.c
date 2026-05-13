@@ -190,6 +190,7 @@ static void usage(FILE *stream, int exit_code) {
           "  vaultcrypt info -i INPUT [--json]\n"
           "  vaultcrypt syncdir -i SOURCE_DIR -o VAULT_DIR [-n ITERATIONS]\n"
           "  vaultcrypt restoredir -i VAULT_DIR -o OUTPUT_DIR\n"
+          "  vaultcrypt init\n"
           "  vaultcrypt selftest\n"
           "\n"
           "Notes:\n"
@@ -2860,6 +2861,38 @@ static void selftest_v3(void) {
   free(prefix_bytes);
 }
 
+static void init_command() {
+  printf("# vaultcrypt Configuration Template\n"
+         "# Save this to ~/.vaultcrypt.conf\n"
+         "\n"
+         "# [SECURITY]\n"
+         "# PBKDF2 Iteration count. Default: 600000\n"
+         "iterations=600000\n"
+         "\n"
+         "# [PERFORMANCE]\n"
+         "# Fast Sync: Skip re-encrypting files if Size and MTime match the manifest.\n"
+         "fast=true\n"
+         "\n"
+         "# [KEYCHAIN]\n"
+         "# macOS Keychain integration settings.\n"
+         "keychain-service=vaultcrypt\n"
+         "# keychain-account=your_user\n"
+         "\n"
+         "# [NAMING]\n"
+         "# The name of the encrypted manifest file.\n"
+         "manifest-name=.vaultcrypt-manifest.vlt\n"
+         "\n"
+         "# [EXCLUSIONS]\n"
+         "# Patterns to ignore. You can add multiple exclude= lines.\n"
+         "exclude=.git\n"
+         "exclude=node_modules\n"
+         "exclude=target\n"
+         "exclude=build\n"
+         "exclude=.DS_Store\n"
+         "exclude=.localized\n"
+         "exclude=*.tmp\n");
+}
+
 static void selftest_command(void) {
   selftest_v3();
   puts("selftest: ok");
@@ -2966,6 +2999,10 @@ int main(int argc, char **argv) {
   }
   if (strcmp(command, "restoredir") == 0) {
     restoredir_command(input_path, output_path, &opts);
+    return 0;
+  }
+  if (strcmp(command, "init") == 0) {
+    init_command();
     return 0;
   }
   if (strcmp(command, "selftest") == 0) {
