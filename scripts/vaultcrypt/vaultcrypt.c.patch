@@ -1,0 +1,315 @@
+--- vaultcrypt.c
++++ vaultcrypt.c
+@@ -11,6 +11,7 @@
+ #include <dirent.h>
+ #include <errno.h>
+ #include <fcntl.h>
++#include <fnmatch.h>
+ #include <readpassphrase.h>
+ #include <stdbool.h>
+ #include <stdint.h>
+@@ -140,6 +141,10 @@
+   int info_json;
+   const char *keychain_service;
+   const char *keychain_account;
++  char **exclude_patterns;
++  size_t exclude_count;
++  int dry_run;
++  int fast_sync;
+ } Options;
+ 
+ typedef struct {
+@@ -193,7 +198,10 @@
+           \"  - syncdir stores ciphertext as flat opaque filenames; plaintext paths only exist inside the encrypted manifest.\n\"
+           \"  - restoredir rebuilds the original plaintext filenames and directory tree from the manifest.\n\"
+           \"  - use --passphrase-keychain-service SERVICE to load the passphrase from macOS Keychain.\n\"
+-          \"  - optional: --passphrase-keychain-account ACCOUNT (defaults to $USER).\n\");
++          \"  - optional: --passphrase-keychain-account ACCOUNT (defaults to $USER).\n\"
++          \"  - use --exclude PATTERN to skip files/dirs (wildcards allowed).\n\"
++          \"  - use --dry-run to see what would happen without modifying files.\n\"
++          \"  - use --fast to skip encryption if size and mtime match manifest.\n\");
+   exit(exit_code);
+ }
+ 
+@@ -693,6 +701,48 @@
+   if (size_out != NULL) {
+     *size_out = total;
+   }
++}
++
++static void add_exclude_pattern(Options *opts, const char *pattern) {
++  opts-\u003eexclude_patterns = (char **)realloc(opts-\u003eexclude_patterns, (opts-\u003eexclude_count + 1u) * sizeof(char *));
++  if (opts-\u003eexclude_patterns == NULL) {
++    fail_msg(\"out of memory\");
++  }
++  opts-\u003eexclude_patterns[opts-\u003eexclude_count++] = xstrdup(pattern);
++}
++
++static bool is_excluded(const char *rel_path, const Options *opts) {
++  size_t i;
++  const char *name = strrchr(rel_path, '/');
++  name = (name == NULL) ? rel_path : name + 1;
++
++  if (strcmp(name, \".DS_Store\") == 0 || strcmp(name, \".localized\") == 0 || strcmp(name, \".vaultcrypt-ignore\") == 0) {
++    return true;
++  }
++
++  for (i = 0; i < opts-\u003eexclude_count; ++i) {
++    if (fnmatch(opts-\u003eexclude_patterns[i], rel_path, 0) == 0 ||
++        fnmatch(opts-\u003eexclude_patterns[i], name, 0) == 0) {
++      return true;
++    }
++  }
++  return false;
++}
++
++static void load_ignore_file(const char *source_dir, Options *opts) {
++  char *path = join_path(source_dir, \".vaultcrypt-ignore\");
++  FILE *fp = fopen(path, \"r\");
++  char *line = NULL;
++  size_t cap = 0u;
++  ssize_t len;
++
++  free(path);
++  if (fp == NULL) return;
++
++  while ((len = getline(\u0026line, \u0026cap, fp)) \u003e 0) {
++    if (line[len - 1] == '\n') line[--len] = '\0';
++    if (len \u003e 0 \u0026\u0026 line[0] != '#') add_exclude_pattern(opts, line);
++  }
++  free(line);
++  fclose(fp);
+ }
+ 
+ static void manifest_init(Manifest *manifest) {
+--- vaultcrypt.c
++++ vaultcrypt.c
+@@ -118,6 +118,7 @@
+ typedef struct {
+   char *rel_path;
+   uint64_t size;
++  uint64_t mtime;
+   char sha256_hex[SHA256_HEX_LEN + 1u];
+   int seen;
+ } ManifestEntry;
+@@ -747,6 +748,7 @@
+   entry = &manifest-\u003eitems[manifest-\u003elen++];
+   entry-\u003erel_path = xstrdup(rel_path);
+   entry-\u003esize = 0u;
++  entry-\u003emtime = 0u;
+   entry-\u003esha256_hex[0] = '\0';
+   entry-\u003eseen = 0;
+   return entry;
+@@ -791,10 +793,11 @@
+   for (i = 0; i < manifest-\u003elen; ++i) {
+     char *path_hex = NULL;
+     ManifestEntry *entry = &manifest-\u003eitems[i];
+ 
+     hex_encode_string(entry-\u003erel_path, \u0026path_hex);
+-    fprintf(fp, \"%s\t%llu\t%s\n\", path_hex, (unsigned long long)entry-\u003esize, entry-\u003esha256_hex);
++    fprintf(fp, \"%s\t%llu\t%llu\t%s\n\", 
++            path_hex, (unsigned long long)entry-\u003esize, (unsigned long long)entry-\u003emtime, entry-\u003esha256_hex);
+     free(path_hex);
+     if (ferror(fp)) {
+       fclose(fp);
+       fail_errno(path);
+@@ -820,31 +823,54 @@
+   while ((line_len = getline(\u0026line, \u0026cap, fp)) \u003e= 0) {
+     char *path_hex;
+     char *size_text;
++    char *mtime_text = NULL;
+     char *hash_text;
+     char *path_value;
+     ManifestEntry *entry;
+     char *end = NULL;
+     unsigned long long parsed_size;
++    unsigned long long parsed_mtime = 0;
+ 
+     if (line_len \u003e 0 \u0026\u0026 line[line_len - 1] == '\n') {
+       line[--line_len] = '\0';
+     }
+     path_hex = strtok(line, \"\t\");
+     size_text = strtok(NULL, \"\t\");
+-    hash_text = strtok(NULL, \"\t\");
+-    if (path_hex == NULL || size_text == NULL || hash_text == NULL || strtok(NULL, \"\t\") != NULL) {
++    mtime_text = strtok(NULL, \"\t\");
++    hash_text = strtok(NULL, \"\t\");
++    
++    // If we have 4 columns, hash_text is the 4th. If 3 columns, hash_text is the 3rd.
++    if (hash_text == NULL) {
++        hash_text = mtime_text;
++        mtime_text = NULL;
++    } else {
++        // Check if there is a 5th column
++        if (strtok(NULL, \"\t\") != NULL) {
++            free(line); fclose(fp); fail_msg(\"manifest file is malformed\");
++        }
++    }
++
++    if (path_hex == NULL || size_text == NULL || hash_text == NULL) {
+       free(line);
+       fclose(fp);
+       fail_msg(\"manifest file is malformed\");
+     }
++
+     errno = 0;
+     parsed_size = strtoull(size_text, \u0026end, 10);
+     if (errno != 0 || end == size_text || *end != '\0') {
+       free(line); fclose(fp); fail_msg(\"manifest size value is invalid\");
+     }
++
++    if (mtime_text != NULL) {
++        parsed_mtime = strtoull(mtime_text, \u0026end, 10);
++        if (errno != 0 || end == mtime_text || *end != '\0') {
++            free(line); fclose(fp); fail_msg(\"manifest mtime value is invalid\");
++        }
++    }
++
+     if (strlen(hash_text) != SHA256_HEX_LEN) {
+       free(line);
+       fclose(fp);
+       fail_msg(\"manifest hash value is invalid\");
+@@ -853,6 +879,7 @@
+     path_value = hex_decode_string_owned(path_hex);
+     entry = manifest_upsert(manifest, path_value);
+     entry-\u003esize = (uint64_t)parsed_size;
++    entry-\u003emtime = (uint64_t)parsed_mtime;
+     memcpy(entry-\u003esha256_hex, hash_text, SHA256_HEX_LEN + 1u);
+     free(path_value);
+   }
+--- vaultcrypt.c
++++ vaultcrypt.c
+@@ -2147,6 +2147,12 @@
+     char *source_path;
+     struct stat st;
+ 
+     if (strcmp(entry-\u003ed_name, \".\") == 0 || strcmp(entry-\u003ed_name, \"..\") == 0) {
+       continue;
+     }
+ 
+@@ -2167,6 +2173,13 @@
+       free(source_path);
+       exit(1);
+     }
+ 
++    if (is_excluded(child_rel, opts)) {
++      if (opts-\u003edry_run) printf(\"[DRY-RUN] Skipping excluded: %s\n\", child_rel);
++      free(child_rel);
++      free(source_path);
++      continue;
++    }
++
+     if (S_ISDIR(st.st_mode)) {
+       syncdir_walk(source_dir,
+                    vault_dir,
+@@ -2190,13 +2203,34 @@
+       uint64_t size = 0;
+       char *cipher_path = vault_file_path(vault_dir, child_rel, name_key);
+       int needs_encrypt = 1;
+-
+-      sha256_file_hex(source_path, sha256_hex, \u0026size);
++      
+       manifest_entry = manifest_upsert(manifest, child_rel);
+       manifest_entry-\u003eseen = 1;
+ 
+-      if (path_exists(cipher_path) \u0026\u0026
+-          manifest_entry-\u003esize == size \u0026\u0026
+-          strcmp(manifest_entry-\u003esha256_hex, sha256_hex) == 0) {
+-        needs_encrypt = 0;
++      if (opts-\u003efast_sync \u0026\u0026 path_exists(cipher_path) \u0026\u0026
++          manifest_entry-\u003esize == (uint64_t)st.st_size \u0026\u0026
++          manifest_entry-\u003emtime == (uint64_t)st.st_mtime) {
++          needs_encrypt = 0;
++      } else {
++          sha256_file_hex(source_path, sha256_hex, \u0026size);
++          if (path_exists(cipher_path) \u0026\u0026
++              manifest_entry-\u003esize == size \u0026\u0026
++              strcmp(manifest_entry-\u003esha256_hex, sha256_hex) == 0) {
++            needs_encrypt = 0;
++          }
++          manifest_entry-\u003esize = size;
++          manifest_entry-\u003emtime = (uint64_t)st.st_mtime;
++          memcpy(manifest_entry-\u003esha256_hex, sha256_hex, sizeof(sha256_hex));
+       }
+ 
+       if (needs_encrypt) {
++        if (opts-\u003edry_run) {
++            printf(\"[DRY-RUN] Would encrypt: %s\n\", child_rel);
++            (*encrypted_count)++;
++        } else {
+           Options local_opts = *opts;
+           local_opts.force = 1;
+           ensure_parent_dir(cipher_path);
+           encrypt_file_with_passphrase(source_path,
+                                        cipher_path,
+                                        iterations,
+                                        \u0026local_opts,
+                                        passphrase,
+                                        0);
+           (*encrypted_count)++;
++        }
+       } else {
+         (*skipped_count)++;
+       }
+ 
+-      manifest_entry-\u003esize = size;
+-      memcpy(manifest_entry-\u003esha256_hex, sha256_hex, sizeof(sha256_hex));
+       remove_legacy_cipher_if_present(vault_dir, child_rel, cipher_path);
+ 
+       free(cipher_path);
+@@ -2268,6 +2302,7 @@
+ static void syncdir_command(const char *source_dir,
+                             const char *vault_dir,
+                             uint32_t iterations,
+                             const Options *opts) {
++  Options local_opts = *opts;
+   char *owned_passphrase = obtain_passphrase(\"Passphrase for vault directory: \", 0, opts);
+   const char *passphrase = owned_passphrase;
+   Manifest manifest;
+@@ -2283,6 +2318,8 @@
+   require_directory(vault_dir, \"syncdir output must be a directory\");
+   derive_name_key(passphrase, name_key);
+ 
++  load_ignore_file(source_dir, \u0026local_opts);
++
+   manifest_init(\u0026manifest);
+   load_manifest_if_present(vault_dir, opts, passphrase, \u0026manifest);
+   manifest_reset_seen(\u0026manifest);
+@@ -2291,10 +2328,15 @@
+   syncdir_walk(source_dir,
+                vault_dir,
+                \"\",
+                name_key,
+-               opts,
++               \u0026local_opts,
+                passphrase,
+                iterations,
+                \u0026manifest,
+                \u0026encrypted_count,
+                \u0026skipped_count);
+ 
+-  prune_removed_entries(vault_dir, name_key, \u0026manifest, \u0026removed_count);
+-  store_manifest(vault_dir, opts, passphrase, iterations, \u0026manifest);
++  if (opts-\u003edry_run) {
++      printf(\"[DRY-RUN] Would prune removed entries...\n\");
++  } else {
++      prune_removed_entries(vault_dir, name_key, \u0026manifest, \u0026removed_count);
++      store_manifest(vault_dir, opts, passphrase, iterations, \u0026manifest);
++  }
+ 
+   printf(\"syncdir: encrypted=%zu skipped=%zu removed=%zu\n\",
+          encrypted_count, skipped_count, removed_count);
+@@ -2710,6 +2752,15 @@
+       opts.info_json = 1;
+     } else if (strcmp(argv[i], \"--json\") == 0) {
+       opts.info_json = 1;
++    } else if (strcmp(argv[i], \"--exclude\") == 0) {
++      if (i + 1 \u003e= argc) fail_msg(\"--exclude requires an argument\");
++      add_exclude_pattern(\u0026opts, argv[++i]);
++    } else if (strcmp(argv[i], \"--dry-run\") == 0) {
++      opts.dry_run = 1;
++    } else if (strcmp(argv[i], \"--fast\") == 0) {
++      opts.fast_sync = 1;
+     } else {
+       fprintf(stderr, \"vaultcrypt: unknown option: %s\n\", argv[i]);
+       usage(stderr, 1);

@@ -1,0 +1,24 @@
+For the "Fast Version," we should definitely go with the Metadata Check (checking size and modification time) because it is significantly faster than hashing 22GB of data every time.
+
+Here is how we should handle the "Refer to this file" vs. "Snapshot" logic:
+
+The "Pro" Strategy: Hybrid Incremental Snapshots
+Instead of doing a full 22GB copy or a complex "Git-style" pointer system, we can leverage how your Mac (APFS) and vaultcrypt work together:
+
+Maintain a "Latest" Vault: We keep one local folder called Documents.latest.vault.
+Incremental Sync: When you run vbackup, vaultcrypt performs an incremental sync against Documents.latest.vault.
+The "Fast" Part: It only checks the Metadata (Size + Mtime). If they match, it doesn't even open the file. This makes the "check" phase take seconds instead of minutes.
+Local Snapshot (Instant): Once the sync is done, we use a macOS feature called APFS Cloning. We "copy" Documents.latest.vault to Documents-2026-05-13.vault.
+On your Mac, this copy is instant and takes 0 bytes of extra space (it only stores the differences).
+Cloud Upload: We then tell rclone to sync that new snapshot to Google Drive.
+The "refer to this file" part: By using a special rclone flag (--track-renames or --link-dest), we can often tell Google Drive to "reuse" the data from yesterday's backup for any files that didn't change, saving you from re-uploading 22GB.
+Why this is better than "Git-style" pointers:
+Simple Restore: Each folder on your Google Drive is a complete, independent vault. You don't need a special tool to "reconstruct" the backup from pointers. You just point vaultcrypt restoredir at any timestamped folder and it works.
+Zero Local Waste: APFS cloning means you can have 100 snapshots on your Mac and they will only take up the space of one backup plus whatever changed.
+Does this sound like a plan?
+I will:
+
+Update vaultcrypt.c to support Metadata-based skipping (the --fast flag).
+Implement APFS cloning logic in your vbackup script.
+Add the .vaultcrypt-ignore support as discussed.
+This gives you the best of both worlds: the speed of Git/Deduplication with the simplicity of full snapshots.

@@ -101,6 +101,9 @@ link_path() {
 
   log "Linking: $target -> $source"
   run_cmd ln -s "$source" "$target"
+  if [[ "$target" == *"/bin/"* ]]; then
+    run_cmd chmod +x "$source"
+  fi
 }
 
 build_c_tool() {
@@ -227,53 +230,6 @@ EOF
   mv "$tmp_launcher" "$launcher_path"
 }
 
-render_template() {
-  local template_path=$1
-  local output_path=$2
-  shift 2
-  local parent tmp_output template_content pair key value
-
-  if [ ! -f "$template_path" ]; then
-    printf 'Missing template file: %s\n' "$template_path" >&2
-    exit 1
-  fi
-
-  parent="$(dirname "$output_path")"
-  ensure_dir "$parent"
-
-  if [ "$DRY_RUN" -eq 1 ]; then
-    log "Rendering template: $output_path <- $template_path"
-    return
-  fi
-
-  template_content="$(cat "$template_path")"
-  for pair in "$@"; do
-    key=${pair%%=*}
-    value=${pair#*=}
-    template_content="${template_content//${key}/${value}}"
-  done
-
-  tmp_output="${output_path}.tmp.$$"
-  printf '%s\n' "$template_content" >"$tmp_output"
-  mv "$tmp_output" "$output_path"
-}
-
-install_launch_agent() {
-  local template_path=$1
-  local rendered_path=$2
-  local linked_path=$3
-  local script_path=$4
-  local log_path=$5
-
-  render_template \
-    "$template_path" \
-    "$rendered_path" \
-    "__SCRIPT_PATH__=$script_path" \
-    "__LOG_PATH__=$log_path"
-
-  link_path "$rendered_path" "$linked_path"
-}
-
 for arg in "$@"; do
   case "$arg" in
     --dry-run)
@@ -306,16 +262,13 @@ ensure_dir "$TARGET_HOME/bin"
 MINIFETCH_SOURCE="$DOTFILES_DIR/scripts/minifetch.c"
 VAULTCRYPT_DIR="$DOTFILES_DIR/scripts/vaultcrypt"
 AUTHER_DIR="$DOTFILES_DIR/scripts/auther"
-LAUNCHD_DIR="$DOTFILES_DIR/launchd"
-LAUNCH_AGENT_TEMPLATE="$LAUNCHD_DIR/com.dotfiles.icloud-documents-backup.plist.tmpl"
-LAUNCH_AGENT_RENDERED="$TARGET_HOME/.local/share/dotfiles/launchagents/com.dotfiles.icloud-documents-backup.plist"
-LAUNCH_AGENT_LINK="$TARGET_HOME/Library/LaunchAgents/com.dotfiles.icloud-documents-backup.plist"
-LAUNCH_AGENT_LOG="$TARGET_HOME/Library/Logs/icloud_backup_launchd.log"
 
 section "Links"
 link_path "$DOTFILES_DIR/.bashrc" "$TARGET_HOME/.bashrc"
 link_path "$DOTFILES_DIR/.bash_profile" "$TARGET_HOME/.bash_profile"
 link_path "$DOTFILES_DIR/.gitconfig" "$TARGET_HOME/.gitconfig"
+link_path "$DOTFILES_DIR/.gitconfig.msu" "$TARGET_HOME/.gitconfig.msu"
+link_path "$DOTFILES_DIR/.vaultcrypt.conf" "$TARGET_HOME/.vaultcrypt.conf"
 if [ -L "$TARGET_HOME/.vimrc" ] || [ -e "$TARGET_HOME/.vimrc" ]; then
   backup_path "$TARGET_HOME/.vimrc"
 fi
@@ -345,30 +298,8 @@ install_python_app \
   "$AUTHER_DIR/requirements.txt" \
   "$TARGET_HOME/bin/auther"
 link_path "$DOTFILES_DIR/scripts/vim" "$TARGET_HOME/bin/vim"
-
-section "Launch Agent"
-install_launch_agent \
-  "$LAUNCH_AGENT_TEMPLATE" \
-  "$LAUNCH_AGENT_RENDERED" \
-  "$LAUNCH_AGENT_LINK" \
-  "$DOTFILES_DIR/scripts/backup.sh" \
-  "$LAUNCH_AGENT_LOG"
+link_path "$DOTFILES_DIR/scripts/backup.sh" "$TARGET_HOME/bin/backup"
 
 section "Done"
 log "Install complete."
 log "Open a new shell or run: source ~/.bash_profile"
-log ""
-log "iCloud Documents backup launch agent:"
-log "  Plist: $LAUNCH_AGENT_LINK"
-log "  Script: $DOTFILES_DIR/scripts/backup.sh"
-log "  Log:    $LAUNCH_AGENT_LOG"
-log ""
-log "Enable it:"
-log "  launchctl bootstrap gui/$(id -u) \"$LAUNCH_AGENT_LINK\""
-log ""
-log "Reload it after changes:"
-log "  launchctl bootout gui/$(id -u) \"$LAUNCH_AGENT_LINK\""
-log "  launchctl bootstrap gui/$(id -u) \"$LAUNCH_AGENT_LINK\""
-log ""
-log "Run it immediately for a test:"
-log "  launchctl kickstart -k gui/$(id -u)/com.dotfiles.icloud-documents-backup"
