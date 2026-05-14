@@ -120,6 +120,15 @@ static const char *RAW_LOGO[] = {
   "           `\"\"\"\"\"\"'  `\"\"\"\"\"'"
 };
 
+static const char *LOGO_BODY_COLORS[] = {
+  "\033[1;32m",
+  "\033[1;33m",
+  "\033[38;5;208m",
+  "\033[1;31m",
+  "\033[1;35m",
+  "\033[1;34m"
+};
+
 static const FieldDef FIELD_DEFS[] = {
   {"user", "user", "User", offsetof(SystemInfo, username), false},
   {"hostname", "hostname", "Hostname", offsetof(SystemInfo, hostname), false},
@@ -2497,6 +2506,29 @@ static size_t build_text_lines(const SystemInfo *info, const Colors *colors,
   return line_count;
 }
 
+static const char *logo_color_for_row(size_t row, const Colors *colors) {
+  const size_t leaf_rows = 6;
+  size_t body_rows;
+  size_t body_row;
+  size_t color_idx;
+
+  if (!colors->use_color) {
+    return "";
+  }
+  if (row < leaf_rows) {
+    return LOGO_BODY_COLORS[0];
+  }
+
+  body_rows = ARRAY_LEN(RAW_LOGO) - leaf_rows;
+  body_row = row - leaf_rows;
+  color_idx = (body_row * ARRAY_LEN(LOGO_BODY_COLORS)) / body_rows;
+  if (color_idx >= ARRAY_LEN(LOGO_BODY_COLORS)) {
+    color_idx = ARRAY_LEN(LOGO_BODY_COLORS) - 1;
+  }
+
+  return LOGO_BODY_COLORS[color_idx];
+}
+
 static void print_logo_output(char lines[MAX_TEXT_LINES][512], size_t line_count,
                               const Colors *colors) {
   char logo_lines[ARRAY_LEN(RAW_LOGO)][256];
@@ -2512,7 +2544,7 @@ static void print_logo_output(char lines[MAX_TEXT_LINES][512], size_t line_count
       logo_width = len;
     }
     snprintf(logo_lines[i], sizeof(logo_lines[i]), "%s%s%s",
-             colors->c2, RAW_LOGO[i], colors->reset);
+             logo_color_for_row(i, colors), RAW_LOGO[i], colors->reset);
   }
 
   if (logo_rows > line_count) {
