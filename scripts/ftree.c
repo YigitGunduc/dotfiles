@@ -2,6 +2,7 @@
 
 #include <ctype.h>
 #include <errno.h>
+#include <fnmatch.h>
 #include <limits.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -48,6 +49,21 @@ typedef struct {
   int error_count;
 } Config;
 
+typedef struct IgnoreRule {
+  char *pattern;
+  bool negated;
+  bool dir_only;
+  bool anchored;
+  bool has_slash;
+  struct IgnoreRule *next;
+} IgnoreRule;
+
+typedef struct IgnoreContext {
+  const char *dir_path;
+  IgnoreRule *rules;
+  struct IgnoreContext *parent;
+} IgnoreContext;
+
 static Config g_cfg = {
   .show_all = false,
   .dirs_only = false,
@@ -91,6 +107,8 @@ static void usage(FILE *stream) {
           "      --no-color         disable color output\n"
           "      --version          print version and exit\n"
           "  -h, --help             show this help text\n\n"
+          "Notes:\n"
+          "  .gitignore files are respected recursively while walking.\n\n"
           "Examples:\n"
           "  ftree\n"
           "  ftree -a -L 2 ~/Developer\n"
@@ -216,6 +234,206 @@ static bool is_ignored(const char *name) {
   }
 
   return false;
+}
+
+static bool has_path_separator(const char *value) {
+  return strchr(value, '/') != NULL;
+}
+
+static char *trim_gitignore_line(char *line) {
+  char *start = line;
+  char *end;
+
+  while (*start != '\0' && isspace((unsigned char) *start)) {
+    start++;
+  }
+
+  end = start + strlen(start);
+  while (end > start && isspace((unsigned char) *(end - 1))) {
+    end--;
+  }
+  *end = '\0';
+
+  return start;
+}
+
+static void append_ignore_rule(IgnoreContext *ctx, const char *line) {
+  IgnoreRule *rule;
+  char *pattern = xstrdup(line);
+  char *cursor = trim_gitignore_line(pattern);
+  size_t len;
+
+  if (*cursor == '\0' || *cursor == '#') {
+    free(pattern);
+    return;
+  }
+
+  rule = xmalloc(sizeof(*rule));
+  memset(rule, 0, sizeof(*rule));
+
+  if (*cursor == '\\' && (cursor[1] == '#' || cursor[1] == '!')) {
+    cursor++;
+  } else if (*cursor == '!') {
+    rule->negated = true;
+    cursor++;
+  }
+
+  while (*cursor == '/') {
+    rule->anchored = true;
+    cursor++;
+  }
+
+  len = strlen(cursor);
+  while (len > 0 && cursor[len - 1] == '/') {
+    rule->dir_only = true;
+    cursor[--len] = '\0';
+  }
+
+  if (*cursor == '\0') {
+    free(rule);
+    free(pattern);
+    return;
+  }
+
+  rule->pattern = xstrdup(cursor);
+  rule->has_slash = has_path_separator(rule->pattern);
+  if (ctx->rules == NULL) {
+    ctx->rules = rule;
+  } else {
+    IgnoreRule *tail = ctx->rules;
+    while (tail->next != NULL) {
+      tail = tail->next;
+    }
+    tail->next = rule;
+  }
+
+  free(pattern);
+}
+
+static IgnoreContext load_ignore_context(const char *dir_path,
+                                         IgnoreContext *parent) {
+  IgnoreContext ctx;
+  char *ignore_path;
+  FILE *file;
+  char *line = NULL;
+  size_t cap = 0;
+  ssize_t len;
+
+  ctx.dir_path = dir_path;
+  ctx.rules = NULL;
+  ctx.parent = parent;
+
+  ignore_path = join_path(dir_path, ".gitignore");
+  file = fopen(ignore_path, "r");
+  free(ignore_path);
+
+  if (file == NULL) {
+    return ctx;
+  }
+
+  while ((len = getline(&line, &cap, file)) != -1) {
+    if (len > 0 && line[len - 1] == '\n') {
+      line[len - 1] = '\0';
+    }
+    append_ignore_rule(&ctx, line);
+  }
+
+  free(line);
+  fclose(file);
+  return ctx;
+}
+
+static void free_ignore_context(IgnoreContext *ctx) {
+  IgnoreRule *rule = ctx->rules;
+
+  while (rule != NULL) {
+    IgnoreRule *next = rule->next;
+    free(rule->pattern);
+    free(rule);
+    rule = next;
+  }
+
+  ctx->rules = NULL;
+}
+
+static const char *relative_to_dir(const char *dir_path, const char *path) {
+  size_t dir_len = strlen(dir_path);
+
+  if (dir_len == 0) {
+    return path;
+  }
+
+  if (strncmp(path, dir_path, dir_len) != 0) {
+    return NULL;
+  }
+
+  if (path[dir_len] == '/') {
+    return path + dir_len + 1;
+  }
+
+  if (dir_path[dir_len - 1] == '/') {
+    return path + dir_len;
+  }
+
+  if (path[dir_len] == '\0') {
+    return path + dir_len;
+  }
+
+  return NULL;
+}
+
+static const char *last_path_component(const char *path) {
+  const char *slash = strrchr(path, '/');
+  return slash == NULL ? path : slash + 1;
+}
+
+static bool rule_matches(const IgnoreRule *rule,
+                         const char *rel_path,
+                         const char *name,
+                         bool is_dir) {
+  if (rule->dir_only && !is_dir) {
+    return false;
+  }
+
+  if (rule->anchored || rule->has_slash) {
+    return fnmatch(rule->pattern, rel_path, FNM_PATHNAME) == 0;
+  }
+
+  return fnmatch(rule->pattern, name, 0) == 0;
+}
+
+static void apply_gitignore_context(const IgnoreContext *ctx,
+                                    const char *path,
+                                    bool is_dir,
+                                    bool *ignored) {
+  const IgnoreRule *rule;
+  const char *rel_path = relative_to_dir(ctx->dir_path, path);
+  const char *name;
+
+  if (ctx->parent != NULL) {
+    apply_gitignore_context(ctx->parent, path, is_dir, ignored);
+  }
+
+  if (rel_path == NULL || *rel_path == '\0') {
+    return;
+  }
+
+  name = last_path_component(rel_path);
+
+  for (rule = ctx->rules; rule != NULL; rule = rule->next) {
+    if (rule_matches(rule, rel_path, name, is_dir)) {
+      *ignored = !rule->negated;
+    }
+  }
+}
+
+static bool is_gitignored(const IgnoreContext *ctx,
+                          const char *path,
+                          bool is_dir) {
+  bool ignored = false;
+
+  apply_gitignore_context(ctx, path, is_dir, &ignored);
+  return ignored;
 }
 
 static void permissions_to_string(mode_t mode, char out[11]) {
@@ -414,7 +632,9 @@ static void print_entry_line(const Entry *entry,
   putchar('\n');
 }
 
-static Entry *read_entries(const char *dir_path, size_t *out_count) {
+static Entry *read_entries(const char *dir_path,
+                           const IgnoreContext *ignore_ctx,
+                           size_t *out_count) {
   DIR *dir = opendir(dir_path);
   struct dirent *dp;
   Entry *entries = NULL;
@@ -435,10 +655,6 @@ static Entry *read_entries(const char *dir_path, size_t *out_count) {
       continue;
     }
 
-    if (is_ignored(dp->d_name)) {
-      continue;
-    }
-
     memset(&entry, 0, sizeof(entry));
     entry.name = xstrdup(dp->d_name);
     entry.path = join_path(dir_path, dp->d_name);
@@ -455,6 +671,13 @@ static Entry *read_entries(const char *dir_path, size_t *out_count) {
     entry.is_dir = S_ISDIR(entry.st.st_mode);
     entry.is_executable = !entry.is_dir && !entry.is_symlink &&
                           (entry.st.st_mode & (S_IXUSR | S_IXGRP | S_IXOTH));
+
+    if (is_ignored(entry.name) ||
+        is_gitignored(ignore_ctx, entry.path, entry.is_dir)) {
+      free(entry.name);
+      free(entry.path);
+      continue;
+    }
 
     if (entry.is_symlink) {
       entry.link_target = read_link_target(entry.path, &entry.st);
@@ -485,7 +708,11 @@ static Entry *read_entries(const char *dir_path, size_t *out_count) {
   return entries;
 }
 
-static void walk_tree(const char *dir_path, int depth, const char *prefix) {
+static void walk_tree(const char *dir_path,
+                      int depth,
+                      const char *prefix,
+                      IgnoreContext *parent_ignore_ctx) {
+  IgnoreContext ignore_ctx;
   Entry *entries;
   size_t count;
   size_t i;
@@ -494,8 +721,10 @@ static void walk_tree(const char *dir_path, int depth, const char *prefix) {
     return;
   }
 
-  entries = read_entries(dir_path, &count);
+  ignore_ctx = load_ignore_context(dir_path, parent_ignore_ctx);
+  entries = read_entries(dir_path, &ignore_ctx, &count);
   if (entries == NULL) {
+    free_ignore_context(&ignore_ctx);
     return;
   }
 
@@ -515,7 +744,7 @@ static void walk_tree(const char *dir_path, int depth, const char *prefix) {
                prefix,
                is_last ? "    " : "|   ");
 
-      walk_tree(entry->path, depth + 1, next_prefix);
+      walk_tree(entry->path, depth + 1, next_prefix, &ignore_ctx);
       free(next_prefix);
     } else {
       g_cfg.file_count++;
@@ -523,6 +752,7 @@ static void walk_tree(const char *dir_path, int depth, const char *prefix) {
   }
 
   free_entries(entries, count);
+  free_ignore_context(&ignore_ctx);
 }
 
 static const char *next_value(int argc, char **argv, int *index, const char *opt) {
@@ -677,7 +907,7 @@ static int print_root_and_walk(const char *path) {
   print_entry_line(&root, "", true, true, root_label);
 
   if (root.is_dir) {
-    walk_tree(root.path, 0, "");
+    walk_tree(root.path, 0, "", NULL);
   } else {
     g_cfg.file_count = 1;
   }

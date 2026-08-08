@@ -1,0 +1,16 @@
+- make file for vaultcrypt
+- make file for ftree, minifetch and other c utils
+- ftree .gitignore support
+
+- download vaultcrypt
+
+run_cmd "$brew_bin" bundle --file "$DOTFILES_DIR/Brewfile" --jobs=4
+
+Given the number of C tools you're building (minifetch, gitprompt, ftree, shamir, vaultcrypt), your install.sh is starting to look like a build system.
+
+It might be cleaner to move all those cc calls into a single Makefile in the scripts/ directory. Then, your install.sh simply calls:
+
+Bash
+section "Compiling C Tools"
+run_cmd make -C "$DOTFILES_DIR/scripts" install PREFIX="$TARGET_HOME/bin"
+This separates installation (shell) from compilation (make).

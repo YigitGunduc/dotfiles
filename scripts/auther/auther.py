@@ -2,9 +2,12 @@
 from __future__ import annotations
 
 import argparse
+import curses
 import getpass
 import importlib
 import json
+import shutil
+import subprocess
 import sys
 import time
 from dataclasses import dataclass
@@ -270,6 +273,36 @@ def progress_bar(remaining: int, interval: int, width: int = 20) -> str:
     return f"[{'━' * filled}{' ' * (width - filled)}]"
 
 
+def clipboard_command() -> list[str] | None:
+    if sys.platform == "darwin" and shutil.which("pbcopy"):
+        return ["pbcopy"]
+    if sys.platform.startswith("linux"):
+        if shutil.which("wl-copy"):
+            return ["wl-copy"]
+        if shutil.which("xclip"):
+            return ["xclip", "-selection", "clipboard"]
+        if shutil.which("xsel"):
+            return ["xsel", "--clipboard", "--input"]
+    if sys.platform.startswith("win") and shutil.which("clip"):
+        return ["clip"]
+    return None
+
+
+def copy_to_clipboard(text: str) -> None:
+    command = clipboard_command()
+    if command is None:
+        raise AuthError(
+            "No clipboard helper found. Install pbcopy, wl-copy, xclip, xsel, or clip for this system."
+        )
+
+    try:
+        subprocess.run(command, input=text.encode("utf-8"), check=True)
+    except OSError as exc:
+        raise AuthError(f"Unable to access the clipboard helper: {exc}") from exc
+    except subprocess.CalledProcessError as exc:
+        raise AuthError("Unable to copy text to the clipboard.") from exc
+
+
 def record_uri(record: SecretRecord, username: str | None = None) -> str:
     user = username or current_user()
     label = quote(f"{record.label}:{user}")
@@ -288,6 +321,13 @@ def load_record(service: str, username: str | None = None) -> SecretRecord:
     if not payload:
         raise AuthError(f"No secret found for '{service}' under macOS user '{username or current_user()}'.")
     return SecretRecord.from_payload(payload, default_service=normalize_service(service))
+
+
+def copy_code(service: str) -> str:
+    record = load_record(service)
+    code = build_totp(record).now()
+    copy_to_clipboard(code)
+    return code
 
 
 def store_secret_interactive(service: str | None = None) -> int:
@@ -353,7 +393,6 @@ def list_services() -> int:
 
 
 def dashboard_table() -> Table:
-    services = load_index()
     table = Table(
         title=f"{APP_NAME} dashboard for {current_user()}",
         border_style="bright_black",
@@ -365,7 +404,8 @@ def dashboard_table() -> Table:
     table.add_column("Window")
     table.add_column("Status")
 
-    if not services:
+    rows = dashboard_entries()
+    if not rows:
         table.add_row(
             "-",
             "-",
@@ -375,37 +415,45 @@ def dashboard_table() -> Table:
         )
         return table
 
-    for service in services:
+    for service, code, ttl, window, status in rows:
+        table.add_row(service, code, ttl, window, status)
+
+    return table
+
+
+def dashboard_entries() -> list[tuple[str, str, str, str, str]]:
+    rows: list[tuple[str, str, str, str, str]] = []
+    for service in load_index():
         try:
             record = load_record(service)
             totp = build_totp(record)
             code = totp.now()
             remaining = seconds_remaining(record.interval)
-            table.add_row(
-                record.label,
-                format_code(code),
-                f"{remaining}s",
-                f"[dim]{progress_bar(remaining, record.interval, width=12)}[/]",
-                f"[green]{record.digits} digits / {record.interval}s[/]",
+            rows.append(
+                (
+                    record.label,
+                    format_code(code),
+                    f"{remaining}s",
+                    progress_bar(remaining, record.interval, width=12),
+                    f"{record.digits} digits / {record.interval}s",
+                )
             )
         except AuthError:
-            table.add_row(service, "-", "-", "-", "[red]missing or invalid[/]")
+            rows.append((service, "-", "-", "-", "missing or invalid"))
+    return rows
 
-    return table
 
-
-def render_dashboard(message: str | None = None) -> None:
-    console.clear()
+def render_dashboard(message: str | None = None) -> Panel:
     content = Table.grid(padding=1)
     content.add_row(f"[dim]{APP_NAME}[/] [cyan]•[/] [dim]macOS user: {current_user()}[/]")
     content.add_row(dashboard_table())
     if message:
         content.add_row(message)
     content.add_row(
-        "[dim]Commands:[/] [bold]show[/] <service>, [bold]add[/], [bold]remove[/] <service>, "
-        "[bold]list[/], [bold]help[/], [bold]quit[/]"
+        "[dim]Commands:[/] [bold]show[/] <service>, [bold]copy[/] <service>, [bold]add[/], "
+        "[bold]remove[/] <service>, [bold]list[/], [bold]help[/], [bold]quit[/]"
     )
-    console.print(Panel(content, border_style="bright_black", expand=False))
+    return Panel(content, border_style="bright_black", expand=False)
 
 
 def dashboard_help() -> str:
@@ -413,60 +461,162 @@ def dashboard_help() -> str:
         f"[{INFO}]App commands:[/] "
         "[bold]add[/] starts secret entry, "
         "[bold]remove <service>[/] deletes a secret, "
+        "[bold]copy <service>[/] copies the current code, "
         "[bold]show <service>[/] opens the focused live code view, "
+        "[bold]show <service> --copy[/] copies before opening the live view, "
         "[bold]list[/] redraws the dashboard, "
-        "[bold]quit[/] exits."
+        "[bold]quit[/] exits. "
+        "The dashboard refreshes every second."
     )
 
 
-def dashboard_command_loop() -> int:
-    message = dashboard_help()
-    while True:
-        render_dashboard(message)
-        raw = Prompt.ask("[bold white]auther[/bold white]").strip()
-        if not raw:
-            message = None
-            continue
+def dashboard_help_plain() -> str:
+    return (
+        "App commands: "
+        "add starts secret entry, "
+        "remove <service> deletes a secret, "
+        "copy <service> copies the current code, "
+        "show <service> opens the focused live code view, "
+        "show <service> --copy copies before opening the live view, "
+        "list redraws the dashboard, "
+        "quit exits. "
+        "The dashboard refreshes every second."
+    )
 
+
+def dashboard_command_loop() -> tuple[str, str | None]:
+    def draw(stdscr: curses.window, input_buffer: str, message: str | None) -> None:
+        stdscr.erase()
+        height, width = stdscr.getmaxyx()
+        rows = dashboard_entries()
+        cursor = 0
+
+        header = f"{APP_NAME} • macOS user: {current_user()}"
+        stdscr.addnstr(0, 0, header, width - 1)
+        stdscr.addnstr(1, 0, "-" * max(0, min(width - 1, len(header))), width - 1)
+
+        line = 2
+        stdscr.addnstr(line, 0, "Service", width - 1)
+        stdscr.addnstr(line, 24, "Code", width - 1)
+        stdscr.addnstr(line, 36, "TTL", width - 1)
+        stdscr.addnstr(line, 44, "Window", width - 1)
+        stdscr.addnstr(line, 61, "Status", width - 1)
+        line += 1
+
+        for service, code, ttl, window, status in rows:
+            if line >= height - 3:
+                break
+            stdscr.addnstr(line, 0, service[:22].ljust(22), width - 1)
+            stdscr.addnstr(line, 24, code[:10].ljust(10), width - 1)
+            stdscr.addnstr(line, 36, ttl[:6].ljust(6), width - 1)
+            stdscr.addnstr(line, 44, f"[{window}]", width - 1)
+            stdscr.addnstr(line, 61, status[:max(0, width - 62)], width - 1)
+            line += 1
+
+        if message:
+            stdscr.addnstr(height - 3, 0, message[: max(0, width - 1)], width - 1)
+
+        prompt = f"auther> {input_buffer}"
+        stdscr.addnstr(height - 1, 0, prompt[: max(0, width - 1)], width - 1)
+        cursor = min(len(prompt), max(0, width - 1))
+        stdscr.move(height - 1, cursor)
+        stdscr.refresh()
+
+    def process_command(raw: str) -> tuple[str, str | None, str | None]:
         parts = raw.split(maxsplit=1)
         command = parts[0].lower()
         argument = parts[1].strip() if len(parts) > 1 else None
 
         if command in {"quit", "exit", "q"}:
-            return 0
+            return "quit", None, None
         if command in {"help", "h", "?"}:
-            message = dashboard_help()
-            continue
+            return "stay", None, dashboard_help_plain()
         if command in {"list", "ls", "refresh"}:
-            message = None
-            continue
-        if command == "add":
-            store_secret_interactive(argument)
-            message = f"[{SUCCESS}]Dashboard updated.[/]"
-            continue
-        if command == "remove":
+            return "stay", None, None
+        if command == "copy":
             if not argument:
-                message = f"[{WARNING}]Usage: remove <service>[/]"
-                continue
-            remove_service(argument)
-            message = f"[{SUCCESS}]Dashboard updated.[/]"
-            continue
+                return "stay", None, "Usage: copy <service>"
+            copied_code = copy_code(argument)
+            return "stay", None, f"Copied {format_code(copied_code)} to clipboard."
         if command == "show":
             if not argument:
-                message = f"[{WARNING}]Usage: show <service>[/]"
-                continue
-            show_code(argument)
-            message = None
-            continue
+                return "stay", None, "Usage: show <service>"
+            return "show", argument, None
+        if command == "add":
+            return "add", argument, None
+        if command == "remove":
+            if not argument:
+                return "stay", None, "Usage: remove <service>"
+            return "remove", argument, None
+        return "stay", None, f"Unknown command: {raw}"
 
-        message = f"[{WARNING}]Unknown command:[/] {raw}"
+    def run_loop(stdscr: curses.window) -> tuple[str, str | None]:
+        curses.curs_set(1)
+        stdscr.keypad(True)
+        stdscr.timeout(250)
+        input_buffer = ""
+        message = dashboard_help_plain()
+        last_refresh = 0.0
+
+        while True:
+            now = time.time()
+            if now - last_refresh >= 1:
+                draw(stdscr, input_buffer, message)
+                last_refresh = now
+
+            ch = stdscr.getch()
+            if ch == -1:
+                continue
+
+            if ch in (curses.KEY_ENTER, 10, 13):
+                raw = input_buffer.strip()
+                input_buffer = ""
+                if not raw:
+                    message = None
+                    draw(stdscr, input_buffer, message)
+                    continue
+                action, argument, new_message = process_command(raw)
+                if new_message is not None:
+                    message = new_message
+                else:
+                    message = None
+                draw(stdscr, input_buffer, message)
+                if action != "stay":
+                    return action, argument
+                continue
+
+            if ch in (curses.KEY_BACKSPACE, 127, 8):
+                input_buffer = input_buffer[:-1]
+                draw(stdscr, input_buffer, message)
+                continue
+
+            if 0 <= ch <= 255 and chr(ch).isprintable():
+                input_buffer += chr(ch)
+                draw(stdscr, input_buffer, message)
+
+        return "quit", None
+
+    return curses.wrapper(run_loop)
 
 
 def run_dashboard(once: bool = False) -> int:
     if once:
-        render_dashboard()
+        console.print(render_dashboard(dashboard_help()))
         return 0
-    return dashboard_command_loop()
+    while True:
+        action, argument = dashboard_command_loop()
+        if action == "quit":
+            return 0
+        if action == "show" and argument:
+            show_code(argument)
+            continue
+        if action == "add":
+            store_secret_interactive(argument)
+            continue
+        if action == "remove" and argument:
+            remove_service(argument)
+            continue
+    return 0
 
 
 def show_code(service: str, once: bool = False, reveal_uri: bool = False) -> int:
@@ -477,7 +627,7 @@ def show_code(service: str, once: bool = False, reveal_uri: bool = False) -> int
         console.print(record_uri(record))
         return 0
 
-    with Live(refresh_per_second=4, console=console) as live:
+    with Live(refresh_per_second=1, console=console) as live:
         while True:
             code = totp.now()
             remaining = seconds_remaining(record.interval)
@@ -493,7 +643,7 @@ def show_code(service: str, once: bool = False, reveal_uri: bool = False) -> int
             live.update(Panel(table, border_style="bright_black", expand=False))
             if once:
                 break
-            time.sleep(0.25)
+            time.sleep(1)
 
     return 0
 
@@ -516,9 +666,17 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Print the normalized otpauth URI for the stored record.",
     )
+    show_parser.add_argument(
+        "--copy",
+        action="store_true",
+        help="Copy the current code to the clipboard before rendering.",
+    )
 
     remove_parser = subparsers.add_parser("remove", help="Delete a stored TOTP secret.")
     remove_parser.add_argument("service", help="Service name to remove.")
+
+    copy_parser = subparsers.add_parser("copy", help="Copy the current TOTP code to the clipboard.")
+    copy_parser.add_argument("service", help="Service name to copy.")
 
     subparsers.add_parser("list", help="List services stored for the current macOS user.")
     app_parser = subparsers.add_parser("app", help="Launch the interactive dashboard.")
@@ -556,12 +714,24 @@ def main(argv: list[str] | None = None) -> int:
         console.print(
             f"[dim]{APP_NAME}[/] [cyan]•[/] [dim]macOS user: {current_user()}[/]\n"
         )
+        if args.copy:
+            copied_code = copy_code(args.service)
+            console.print(f"[{SUCCESS}]Copied {format_code(copied_code)} to clipboard.[/]\n")
+            if args.once or args.reveal_uri:
+                return 0
         return show_code(args.service, once=args.once, reveal_uri=args.reveal_uri)
     if args.command == "remove":
         console.print(
             f"[dim]{APP_NAME}[/] [cyan]•[/] [dim]macOS user: {current_user()}[/]\n"
         )
         return remove_service(args.service)
+    if args.command == "copy":
+        console.print(
+            f"[dim]{APP_NAME}[/] [cyan]•[/] [dim]macOS user: {current_user()}[/]\n"
+        )
+        copied_code = copy_code(args.service)
+        console.print(f"[{SUCCESS}]Copied {format_code(copied_code)} to clipboard.[/]")
+        return 0
     if args.command == "list":
         console.print(
             f"[dim]{APP_NAME}[/] [cyan]•[/] [dim]macOS user: {current_user()}[/]\n"

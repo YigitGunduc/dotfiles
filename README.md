@@ -87,6 +87,9 @@ vaultcrypt enc -i wallet-seed.txt
 vaultcrypt dec -i wallet-seed.txt.vlt -o -
 vaultcrypt info -i wallet-seed.txt.vlt
 vaultcrypt info --json -i wallet-seed.txt.vlt
+vaultcrypt enc -i wallet-seed.txt --passphrase-keychain-service vaultcrypt-documents
+vaultcrypt syncdir -i ~/Documents -o ~/Backups/Documents.vault
+vaultcrypt restoredir -i ~/Backups/Documents.vault -o ~/Documents.restore
 vaultcrypt selftest
 ```
 
@@ -96,6 +99,9 @@ Practical rules:
 - Keep the passphrase separate from the ciphertext
 - Test decryption immediately after creating a backup
 - Use `-o -` or `--stdout` explicitly if you want decrypted plaintext on stdout
+- `syncdir` stores an encrypted manifest so it can skip unchanged files on the next run
+- `syncdir` and `restoredir` preserve plaintext filenames and directory names; they encrypt file contents, not path metadata
+- Keychain mode uses a generic password item selected by service and optional account; if account is omitted, `vaultcrypt` uses `$USER`
 
 Recovery note:
 - `vaultcrypt info` prints the full header, including the raw header hex plus the salt and IV

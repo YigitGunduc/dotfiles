@@ -17,3 +17,11 @@ export PATH="$HOME/.antigravity/antigravity/bin:$PATH"
 if [ -f "$HOME/.bashrc" ]; then
     source "$HOME/.bashrc"
 fi
+
+# bun
+export BUN_INSTALL="$HOME/.bun"
+export PATH="$BUN_INSTALL/bin:$PATH"
+
+
+# Added by Antigravity CLI installer
+export PATH="/Users/anakin/.local/bin:$PATH"

@@ -220,5 +220,10 @@ if [[ -t 1 && "${TERM:-}" != "dumb" && "${SHLVL:-1}" -eq 1 ]] && command -v mini
 fi
 
 if command -v zoxide >/dev/null 2>&1; then
-  eval "$(zoxide init bash)"
+  eval "$(zoxide init --cmd cd bash)"
 fi
+
+
+# Added by Antigravity CLI installer
+export PATH="/Users/anakin/.local/bin:$PATH"
+export PYTHONDONTWRITEBYTECODE=1

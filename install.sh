@@ -274,6 +274,9 @@ if [ -L "$TARGET_HOME/.vimrc" ] || [ -e "$TARGET_HOME/.vimrc" ]; then
 fi
 link_path "$DOTFILES_DIR/.vim/vimrc" "$TARGET_HOME/.vim/vimrc"
 link_path "$DOTFILES_DIR/.vim/colors/gruvbox.vim" "$TARGET_HOME/.vim/colors/gruvbox.vim"
+link_path "$DOTFILES_DIR/scripts/vim" "$TARGET_HOME/bin/vim"
+link_path "$DOTFILES_DIR/scripts/backup.sh" "$TARGET_HOME/bin/backup"
+link_path "$DOTFILES_DIR/scripts/restore.sh" "$TARGET_HOME/bin/restore"
 
 section "Builds"
 if [ "$(uname -s)" = "Darwin" ]; then
@@ -297,8 +300,7 @@ install_python_app \
   "$AUTHER_DIR/auther.py" \
   "$AUTHER_DIR/requirements.txt" \
   "$TARGET_HOME/bin/auther"
-link_path "$DOTFILES_DIR/scripts/vim" "$TARGET_HOME/bin/vim"
-link_path "$DOTFILES_DIR/scripts/backup.sh" "$TARGET_HOME/bin/backup"
+
 
 section "Done"
 log "Install complete."

@@ -1,6 +1,6 @@
 [user]
 	name = Yigit Gunduc
-	email = 5940-gunducyi@users.noreply.gitlab.msu.edu
+	email = ygunduc@gmail.com
 [pull]
 	rebase = true
 [fetch]
@@ -12,3 +12,6 @@
 	co = checkout
 	br = branch
 	lg = log --graph --decorate --oneline --all
+# Conditional override for MSU
+[includeIf "gitdir:~/Developer/msu/"]
+    path = ~/.gitconfig.msu
