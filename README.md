@@ -12,7 +12,7 @@ cd ~/.dotfiles
 source ~/.bash_profile
 ```
 
-On macOS, `install.sh` installs Homebrew packages from [Brewfile](/Users/anakin/.dotfiles/Brewfile) when Homebrew is available. On Debian/Ubuntu Linux it installs the matching apt packages (including the compiler, Python venv support, fzf, ripgrep, fd, bat, and zoxide when available). If you only want the symlinks and local binaries:
+On macOS, `install.sh` installs Homebrew packages from [Brewfile](/Users/anakin/.dotfiles/Brewfile) when Homebrew is available. On Debian/Ubuntu Linux it installs the matching apt packages (including a lightweight `gcc`/`make`/`libc6-dev` toolchain, Python venv support, fzf, ripgrep, fd, bat, and zoxide when available). If you only want the symlinks and local binaries:
 
 ```bash
 ./install.sh --skip-brew
