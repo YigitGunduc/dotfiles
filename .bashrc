@@ -21,10 +21,10 @@ PROMPT_COMMAND='history -a; history -n'
 ########################################
 # Platform detection
 ########################################
-case "$(uname -s)" in
-  Darwin) IS_MAC=1 ;;
-  Linux)  IS_LINUX=1 ;;
-  *)      IS_OTHER=1 ;;
+case "$(uname -s 2>/dev/null)" in
+  Darwin) IS_MAC=1; IS_LINUX=0; IS_OTHER=0 ;;
+  Linux)  IS_MAC=0; IS_LINUX=1; IS_OTHER=0 ;;
+  *)      IS_MAC=0; IS_LINUX=0; IS_OTHER=1 ;;
 esac
 
 
@@ -33,7 +33,7 @@ esac
 ########################################
 export EDITOR=vim
 
-if [[ $IS_MAC ]]; then
+if [[ $IS_MAC -eq 1 ]]; then
   export CLICOLOR=1
   alias ls='ls -G'
 else
@@ -59,19 +59,24 @@ do
   fi
 done
 
-if command -v fd >/dev/null 2>&1; then
-  export FZF_DEFAULT_COMMAND='fd --type f --hidden --follow --exclude .git'
+if command -v fd >/dev/null 2>&1 || command -v fdfind >/dev/null 2>&1; then
+  FZF_FILE_COMMAND="fd"
+  command -v fd >/dev/null 2>&1 || FZF_FILE_COMMAND="fdfind"
+  export FZF_DEFAULT_COMMAND="$FZF_FILE_COMMAND --type f --hidden --follow --exclude .git"
   export FZF_CTRL_T_COMMAND="$FZF_DEFAULT_COMMAND"
 fi
 
-if command -v bat >/dev/null 2>&1; then
-  export FZF_CTRL_T_OPTS='--preview "bat --style=numbers --color=always --line-range=:200 {}"'
+if command -v bat >/dev/null 2>&1 || command -v batcat >/dev/null 2>&1; then
+  BAT_COMMAND="bat"
+  command -v bat >/dev/null 2>&1 || BAT_COMMAND="batcat"
+  export FZF_CTRL_T_OPTS="--preview '$BAT_COMMAND --style=numbers --color=always --line-range=:200 {}'"
 fi
 
 if command -v fzf >/dev/null 2>&1; then
   for fzf_script in \
     /opt/homebrew/opt/fzf/shell/completion.bash \
-    /usr/local/opt/fzf/shell/completion.bash
+    /usr/local/opt/fzf/shell/completion.bash \
+    /usr/share/doc/fzf/examples/completion.bash
   do
     if [ -f "$fzf_script" ]; then
       source "$fzf_script"
@@ -81,7 +86,8 @@ if command -v fzf >/dev/null 2>&1; then
 
   for fzf_script in \
     /opt/homebrew/opt/fzf/shell/key-bindings.bash \
-    /usr/local/opt/fzf/shell/key-bindings.bash
+    /usr/local/opt/fzf/shell/key-bindings.bash \
+    /usr/share/doc/fzf/examples/key-bindings.bash
   do
     if [ -f "$fzf_script" ]; then
       source "$fzf_script"
@@ -118,6 +124,7 @@ up() {
 
 # jump to iCloud Drive
 icloud() {
+  [[ $IS_MAC -eq 1 ]] || { printf 'iCloud is only available on macOS\\n' >&2; return 1; }
   cd "$HOME/Library/Mobile Documents/com~apple~CloudDocs" || return
 }
 
@@ -136,6 +143,11 @@ drive() {
 prompt_update() {
   local prompt_path
   local env_prompt=""
+  local host_separator="@"
+
+  if [[ $IS_MAC -eq 1 ]]; then
+    host_separator=""
+  fi
 
   prompt_path="$(short_path)"
   if command -v gitprompt >/dev/null 2>&1; then
@@ -153,7 +165,7 @@ prompt_update() {
   fi
 
   if [[ "$color_prompt" == "yes" ]]; then
-    PS1="\[\e[96m\]${env_prompt}\[\e[m\][\[\e[92m\]\u\[\e[m\]\[\e[94m\]\h\[\e[m\]:\[\e[93m\]${prompt_path}\[\e[m\]]\[\e[91m\]${PROMPT_GIT}\[\e[m\] \\$ "
+    PS1="\[\e[96m\]${env_prompt}\[\e[m\][\[\e[92m\]\u\[\e[m\]${host_separator}\[\e[94m\]\h\[\e[m\]:\[\e[93m\]${prompt_path}\[\e[m\]]\[\e[91m\]${PROMPT_GIT}\[\e[m\] \\$ "
   else
     PS1="${env_prompt}[\u@\h:${prompt_path}]${PROMPT_GIT} \\$ "
   fi
@@ -205,7 +217,11 @@ fi
 alias v='vim'
 alias h='history'
 alias c='clear'
-alias o='open .'           # keep native macOS open
+if [[ $IS_MAC -eq 1 ]]; then
+  alias o='open .'
+elif command -v xdg-open >/dev/null 2>&1; then
+  alias o='xdg-open .'
+fi
 
 if [ -f "$HOME/.bashrc.local" ]; then
   source "$HOME/.bashrc.local"
@@ -224,6 +240,4 @@ if command -v zoxide >/dev/null 2>&1; then
 fi
 
 
-# Added by Antigravity CLI installer
-export PATH="/Users/anakin/.local/bin:$PATH"
 export PYTHONDONTWRITEBYTECODE=1

@@ -6,6 +6,7 @@ DOTFILES_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TARGET_HOME="${HOME}"
 DRY_RUN=0
 SKIP_BREW=0
+SKIP_PACKAGES=0
 TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
 
 usage() {
@@ -16,6 +17,7 @@ Usage:
   ./install.sh
   ./install.sh --dry-run
   ./install.sh --skip-brew
+  ./install.sh --skip-packages
   HOME=/some/other/home ./install.sh
 EOF
 }
@@ -72,6 +74,45 @@ ensure_homebrew_packages() {
 
   log "Installing Homebrew packages from: $DOTFILES_DIR/Brewfile"
   run_cmd "$brew_bin" bundle --file "$DOTFILES_DIR/Brewfile"
+}
+
+ensure_linux_packages() {
+  local package_manager missing=() package
+
+  [ "$SKIP_PACKAGES" -eq 1 ] && { log "Skipping Linux packages."; return; }
+  [ "$(uname -s)" = "Linux" ] || return
+
+  if command -v apt-get >/dev/null 2>&1; then
+    package_manager=apt-get
+  else
+    log "apt-get not found; skipping optional Linux packages."
+    return
+  fi
+
+  # Keep the feature set aligned with Brewfile. fdfind/batcat are Ubuntu names.
+  for package in build-essential python3 python3-venv vim fzf ripgrep fd-find bat colordiff zoxide; do
+    if dpkg-query -W -f='${Status}' "$package" 2>/dev/null | grep -q 'install ok installed'; then
+      continue
+    fi
+    if apt-cache show "$package" >/dev/null 2>&1; then
+      missing+=("$package")
+    else
+      log "Linux package unavailable in apt sources; keeping feature optional: $package"
+    fi
+  done
+  [ "${#missing[@]}" -gt 0 ] || { log "Linux packages already installed."; return; }
+
+  log "Installing Linux packages: ${missing[*]}"
+  if [ "$(id -u)" -eq 0 ]; then
+    run_cmd "$package_manager" update
+    run_cmd "$package_manager" install -y "${missing[@]}"
+  elif command -v sudo >/dev/null 2>&1; then
+    run_cmd sudo "$package_manager" update
+    run_cmd sudo "$package_manager" install -y "${missing[@]}"
+  else
+    printf 'Missing sudo/root access; cannot install Linux packages: %s\n' "${missing[*]}" >&2
+    exit 1
+  fi
 }
 
 backup_path() {
@@ -238,6 +279,9 @@ for arg in "$@"; do
     --skip-brew)
       SKIP_BREW=1
       ;;
+    --skip-packages)
+      SKIP_PACKAGES=1
+      ;;
     --help|-h)
       usage
       exit 0
@@ -255,6 +299,7 @@ log "Dotfiles source: $DOTFILES_DIR"
 log "Target home:     $TARGET_HOME"
 
 ensure_homebrew_packages
+ensure_linux_packages
 
 section "Directories"
 ensure_dir "$TARGET_HOME/bin"
@@ -284,13 +329,18 @@ if [ "$(uname -s)" = "Darwin" ]; then
     -framework ApplicationServices \
     -framework CoreFoundation \
     -framework IOKit
-  install_built_binary \
-    "$VAULTCRYPT_DIR/build-vaultcrypt.sh" \
-    "$VAULTCRYPT_DIR/vaultcrypt" \
-    "$TARGET_HOME/bin/vaultcrypt"
+  if [ -x "$VAULTCRYPT_DIR/build-vaultcrypt.sh" ]; then
+    install_built_binary "$VAULTCRYPT_DIR/build-vaultcrypt.sh" "$VAULTCRYPT_DIR/vaultcrypt" "$TARGET_HOME/bin/vaultcrypt"
+  else
+    log "Skipping vaultcrypt: source/build script is not present in this checkout."
+  fi
 else
   build_c_tool "$MINIFETCH_SOURCE" "$TARGET_HOME/bin/minifetch"
-  log "Skipping vaultcrypt: requires macOS CommonCrypto."
+  if [ -x "$VAULTCRYPT_DIR/build-vaultcrypt.sh" ]; then
+    install_built_binary "$VAULTCRYPT_DIR/build-vaultcrypt.sh" "$VAULTCRYPT_DIR/vaultcrypt" "$TARGET_HOME/bin/vaultcrypt"
+  else
+    log "Skipping vaultcrypt: source/build script is not present in this checkout."
+  fi
 fi
 build_c_tool "$DOTFILES_DIR/scripts/gitprompt.c" "$TARGET_HOME/bin/gitprompt"
 build_c_tool "$DOTFILES_DIR/scripts/ftree.c" "$TARGET_HOME/bin/ftree"

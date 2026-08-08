@@ -6,14 +6,21 @@ set -euo pipefail
 
 # --- Configuration ---
 # Target destination on Google Drive
-DEST_ROOT="/Users/anakin/Library/CloudStorage/GoogleDrive-ygunduc@gmail.com/My Drive/Backups"
+if [[ "$(uname -s)" == "Darwin" ]]; then
+    DEFAULT_DEST_ROOT="/Users/anakin/Library/CloudStorage/GoogleDrive-ygunduc@gmail.com/My Drive/Backups"
+    LOCAL_STAGE_ROOT_DEFAULT="$HOME/Library/Caches/vaultcrypt-backups"
+else
+    DEFAULT_DEST_ROOT="$HOME/Backups"
+    LOCAL_STAGE_ROOT_DEFAULT="${XDG_CACHE_HOME:-$HOME/.cache}/vaultcrypt-backups"
+fi
+DEST_ROOT="${VAULTCRYPT_DEST_ROOT:-$DEFAULT_DEST_ROOT}"
 # Path to vaultcrypt binary
-VAULTCRYPT_BIN="/Users/anakin/bin/vaultcrypt"
+VAULTCRYPT_BIN="${VAULTCRYPT_BIN:-$HOME/bin/vaultcrypt}"
 # Keychain configuration
 KEYCHAIN_SERVICE="vaultcrypt"
 KEYCHAIN_ACCOUNT="$USER"
 # Local staging area to avoid slow cloud filesystem writes during encryption
-LOCAL_STAGE_ROOT="$HOME/Library/Caches/vaultcrypt-backups"
+LOCAL_STAGE_ROOT="${VAULTCRYPT_STAGE_ROOT:-$LOCAL_STAGE_ROOT_DEFAULT}"
 # Max time to wait for iCloud materialization (1 hour)
 MAX_WAIT=3600
 WAIT_INTERVAL=10
@@ -64,7 +71,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 # 2. Prevent sleep during the process (Caffeinate Wrapper)
-if [[ "$IS_CAFFEINATED" == "false" ]]; then
+if [[ "$IS_CAFFEINATED" == "false" && "$(uname -s)" == "Darwin" ]] && command -v caffeinate >/dev/null 2>&1; then
     if [ ${#ARGS[@]} -lt 1 ]; then
         echo "Usage: $(basename "$0") [--fast] [--dry-run] <directory>"
         exit 1
@@ -95,11 +102,13 @@ SOURCE_DIR=$(cd "${ARGS[0]}" &>/dev/null && pwd || fail "Source directory not fo
 command -v rclone >/dev/null 2>&1 || fail "rclone not found in PATH"
 
 # Check if keychain item exists
-security find-generic-password -a "$KEYCHAIN_ACCOUNT" -s "$KEYCHAIN_SERVICE" -w >/dev/null 2>&1 || \
-    fail "Keychain item not found (Service: $KEYCHAIN_SERVICE, Account: $KEYCHAIN_ACCOUNT). Please add it first."
+if [[ "$(uname -s)" == "Darwin" ]]; then
+    security find-generic-password -a "$KEYCHAIN_ACCOUNT" -s "$KEYCHAIN_SERVICE" -w >/dev/null 2>&1 || \
+        fail "Keychain item not found (Service: $KEYCHAIN_SERVICE, Account: $KEYCHAIN_ACCOUNT). Please add it first."
+fi
 
-# 5. Handle iCloud / Offline files (Skip if dry-run)
-if [ -z "$DRY_RUN" ]; then
+# 5. Handle iCloud / Offline files on macOS (Skip if dry-run)
+if [[ "$(uname -s)" == "Darwin" && -z "$DRY_RUN" ]]; then
     materialize "$SOURCE_DIR"
     echo "Checking for offline files..."
     ELAPSED=0
@@ -116,7 +125,7 @@ if [ -z "$DRY_RUN" ]; then
         sleep "$WAIT_INTERVAL"
         ELAPSED=$((ELAPSED + WAIT_INTERVAL))
     done
-else
+elif [[ "$(uname -s)" == "Darwin" ]]; then
     echo "[DRY-RUN] Skipping iCloud materialization check."
 fi
 
@@ -135,10 +144,15 @@ echo "Preparing backup: $VAULT_SNAPSHOT_NAME"
 
 # 7. Perform incremental encryption to local .latest stage
 echo "Syncing to local stage (Incremental)..."
+VAULTCRYPT_ARGS=()
+[[ -n "$FAST_MODE" ]] && VAULTCRYPT_ARGS+=("$FAST_MODE")
+[[ -n "$DRY_RUN" ]] && VAULTCRYPT_ARGS+=("$DRY_RUN")
+if [[ "$(uname -s)" == "Darwin" ]]; then
+    VAULTCRYPT_ARGS+=(--passphrase-keychain-service "$KEYCHAIN_SERVICE")
+    VAULTCRYPT_ARGS+=(--passphrase-keychain-account "$KEYCHAIN_ACCOUNT")
+fi
 "$VAULTCRYPT_BIN" syncdir -i "$SOURCE_DIR" -o "$LATEST_STAGE" \
-    $FAST_MODE $DRY_RUN \
-    --passphrase-keychain-service "$KEYCHAIN_SERVICE" \
-    --passphrase-keychain-account "$KEYCHAIN_ACCOUNT"
+    "${VAULTCRYPT_ARGS[@]}"
 
 # 8. Create instant APFS clone for the cloud upload
 if [ -z "$DRY_RUN" ]; then

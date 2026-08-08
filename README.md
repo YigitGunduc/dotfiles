@@ -4,7 +4,7 @@ Minimal personal dotfiles for Bash and Vim, with a few small native CLI tools.
 
 ## Install
 
-Install the dotfiles and compile local tools:
+Install the dotfiles, provision platform packages, and compile local tools:
 
 ```bash
 cd ~/.dotfiles
@@ -12,11 +12,15 @@ cd ~/.dotfiles
 source ~/.bash_profile
 ```
 
-`install.sh` also installs Homebrew packages from [Brewfile](/Users/anakin/.dotfiles/Brewfile) when Homebrew is available. If you only want the symlinks and local binaries:
+On macOS, `install.sh` installs Homebrew packages from [Brewfile](/Users/anakin/.dotfiles/Brewfile) when Homebrew is available. On Debian/Ubuntu Linux it installs the matching apt packages (including the compiler, Python venv support, fzf, ripgrep, fd, bat, and zoxide when available). If you only want the symlinks and local binaries:
 
 ```bash
 ./install.sh --skip-brew
 ```
+
+Use `./install.sh --skip-packages` to skip Linux package installation.
+
+The installer detects macOS and Linux automatically. `minifetch` keeps the macOS logo on macOS and uses the lightweight Pi/Linux logo on Linux. macOS-only integrations such as Homebrew shell setup, iCloud, `open`, Keychain backup credentials, and caffeinate remain enabled only on macOS; Linux keeps the corresponding shell, search, build, TOTP, and backup features with native paths and passphrase prompting.
 
 Dry run:
 
@@ -62,7 +66,8 @@ System/runtime assumptions:
 - Vim with `+clipboard`
 - `cc` to compile local C tools
 - Homebrew at `/opt/homebrew/bin/brew` or `/usr/local/bin/brew`
-- macOS `open` and Docker Desktop path are assumed in `.bash_profile`
+- macOS `open`, Docker Desktop, and Keychain integrations are detected only on macOS
+- Linux uses `xdg-open` when available and `$HOME/Backups` / `${XDG_CACHE_HOME:-$HOME/.cache}` for backup staging
 
 ## Sensitive Files
 

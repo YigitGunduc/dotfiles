@@ -6,7 +6,7 @@ set -euo pipefail
 
 # --- Configuration ---
 # Path to vaultcrypt binary
-VAULTCRYPT_BIN="/Users/anakin/bin/vaultcrypt"
+VAULTCRYPT_BIN="${VAULTCRYPT_BIN:-$HOME/bin/vaultcrypt}"
 # Keychain configuration
 KEYCHAIN_SERVICE="vaultcrypt"
 KEYCHAIN_ACCOUNT="$USER"
@@ -40,16 +40,22 @@ OUTPUT_DIR=$(mkdir -p "$OUTPUT_DIR" && cd "$OUTPUT_DIR" &>/dev/null && pwd || fa
 [ -x "$VAULTCRYPT_BIN" ] || fail "vaultcrypt binary not found at $VAULTCRYPT_BIN"
 
 # Check if keychain item exists (optional check for UX)
-security find-generic-password -a "$KEYCHAIN_ACCOUNT" -s "$KEYCHAIN_SERVICE" -w >/dev/null 2>&1 || \
-    echo "Warning: Keychain item not found (Service: $KEYCHAIN_SERVICE, Account: $KEYCHAIN_ACCOUNT). You will be prompted for a passphrase."
+if [[ "$(uname -s)" == "Darwin" ]]; then
+    security find-generic-password -a "$KEYCHAIN_ACCOUNT" -s "$KEYCHAIN_SERVICE" -w >/dev/null 2>&1 || \
+        echo "Warning: Keychain item not found (Service: $KEYCHAIN_SERVICE, Account: $KEYCHAIN_ACCOUNT). You will be prompted for a passphrase."
+fi
 
 echo "Restoring vault from: $VAULT_DIR"
 echo "Restoring to: $OUTPUT_DIR"
 
 # Perform restore
+VAULTCRYPT_ARGS=()
+if [[ "$(uname -s)" == "Darwin" ]]; then
+    VAULTCRYPT_ARGS+=(--passphrase-keychain-service "$KEYCHAIN_SERVICE")
+    VAULTCRYPT_ARGS+=(--passphrase-keychain-account "$KEYCHAIN_ACCOUNT")
+fi
 "$VAULTCRYPT_BIN" restoredir -i "$VAULT_DIR" -o "$OUTPUT_DIR" \
-    --passphrase-keychain-service "$KEYCHAIN_SERVICE" \
-    --passphrase-keychain-account "$KEYCHAIN_ACCOUNT"
+    "${VAULTCRYPT_ARGS[@]}"
 
 echo "------------------------------------------------"
 echo "SUCCESS: Restore completed"

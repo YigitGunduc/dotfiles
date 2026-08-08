@@ -1,0 +1,7 @@
+# Local/generated files
+__pycache__/
+*.py[cod]
+*.tmp.*
+
+# macOS metadata
+.DS_Store
