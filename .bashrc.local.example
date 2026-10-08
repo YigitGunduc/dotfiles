@@ -1,6 +1,8 @@
 # Machine-specific interactive Bash tweaks.
 # This file is intentionally not linked by install.sh.
 # Copy to ~/.bashrc.local on machines where you want local-only settings.
+# Machine-specific PATH lines can also go in ~/.bash_profile, which is a
+# local stub (not a repo link) written by install.sh.
 
 # Example:
 # export PATH="$HOME/.cargo/bin:$PATH"

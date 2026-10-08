@@ -1,5 +1,4 @@
-[ ] sort the bashrc, bashlocal bash-profile thing
-[ ] add a reminding to create a .secrets folder in the $HOME
+[x] sort the bashrc, bashlocal bash-profile thing
+[x] add a reminding to create a .secrets folder in the $HOME (dotfiles-doctor)
 [ ] backup script
 [ ] live search on encrypted files
-

@@ -1,435 +1,118 @@
 # Dotfiles
 
-Minimal personal dotfiles for Bash and Vim, with a few small native CLI tools.
+Personal Bash, Git and Vim setup with a few small native CLI tools.
 
-## Install
-
-Install the dotfiles, provision platform packages, and compile local tools:
+## Quick start
 
 ```bash
-cd ~/.dotfiles
-./install.sh
-source ~/.bash_profile
+git clone git@github.com:YigitGunduc/dotfiles.git ~/.dotfiles
+~/.dotfiles/install.sh
+exec bash -l
 ```
 
-On macOS, `install.sh` installs Homebrew packages from [Brewfile](/Users/anakin/.dotfiles/Brewfile) when Homebrew is available. On Debian/Ubuntu Linux it installs the matching apt packages (including a lightweight `gcc`/`make`/`libc6-dev` toolchain, Python venv support, fzf, ripgrep, fd, bat, and zoxide when available). If you only want the symlinks and local binaries:
+Re-running `install.sh` is safe and fast: links that are already correct are
+left alone, and tools are only rebuilt when their source changed.
+
+## Profiles
+
+The installer picks a profile from the OS. Override it with `--minimal` or `--full`.
+
+| | **minimal** (Linux default) | **full** (macOS default) |
+|---|---|---|
+| Bash, Git, Vim config | ✓ | ✓ |
+| `minifetch`, `gitprompt`, `ftree`, `shamir` (built with `cc`) | ✓ if `cc` exists | ✓ (requires `cc`) |
+| Packages ([Brewfile](Brewfile) / apt) | – | ✓ |
+| `backup`, `restore`, `.vaultcrypt.conf` | – | ✓ |
+| `auther` (Python venv) | – | ✓ |
+| Needs sudo, network, Python | no | for packages and auther |
+
+The minimal profile needs nothing beyond Bash; `fzf`, `rg`, `fd`, `bat`,
+`zoxide` and `colordiff` are used automatically when they happen to be installed.
+Without a C compiler it skips the tools and the prompt simply has no git branch.
+
+Other options: `--dry-run`, `--skip-brew`, `--skip-packages` (Linux full),
+and `HOME=/other/home ./install.sh`.
+
+On a new Mac, install the compiler with `xcode-select --install` and Homebrew
+from <https://brew.sh> first.
+
+## Doctor
 
 ```bash
-./install.sh --skip-brew
+dotfiles-doctor
 ```
 
-Use `./install.sh --skip-packages` to skip Linux package installation.
+Runs at the end of every install and checks links, built tools (including
+stale builds), optional commands and, for the full profile, Homebrew packages,
+vaultcrypt, rclone, the Keychain item, auther and `~/.secrets`. It also lists
+files in `~/bin` that the dotfiles don't manage. Exits non-zero if something is broken.
 
-The installer detects macOS and Linux automatically. `minifetch` keeps the macOS logo on macOS and uses the lightweight Pi/Linux logo on Linux. macOS-only integrations such as Homebrew shell setup, iCloud, `open`, Keychain backup credentials, and caffeinate remain enabled only on macOS; Linux keeps the corresponding shell, search, build, TOTP, and backup features with native paths and passphrase prompting.
+## Layout
 
-Dry run:
-
-```bash
-./install.sh --dry-run
-```
-
-## What Gets Installed
-
-`install.sh` does three things:
-
-- Installs Homebrew packages from [Brewfile](/Users/anakin/.dotfiles/Brewfile) when Homebrew is available
-- Symlinks:
-  - `.bashrc`
-  - `.bash_profile`
-  - `.gitconfig`
-  - `.vim/vimrc`
-  - `.vim/colors/gruvbox.vim`
-- Installs to `~/bin`:
-  - `minifetch`
-  - `gitprompt`
-  - `ftree`
-  - `vaultcrypt`
-  - `vim`
-
-If a target already exists, it gets backed up to `*.bak.<timestamp>`.
-
-## Dependencies
-
-Current Homebrew packages from [Brewfile](/Users/anakin/.dotfiles/Brewfile):
-
-- `bat`: syntax-highlighted file viewer, also used for `fzf` previews
-- `bash-completion`: lightweight programmable completion for Bash commands
-- `colordiff`: colorized `diff`
-- `fd`: fast file finder, used as the `fzf` file source
-- `fzf`: fuzzy finder for terminal selection
-- `ripgrep`: fast file content search via `rg`
-- `zoxide`: smarter directory jumping with `z` and `zi`
-
-System/runtime assumptions:
-
-- Bash
-- Vim with `+clipboard`
-- `cc` to compile local C tools
-- Homebrew at `/opt/homebrew/bin/brew` or `/usr/local/bin/brew`
-- macOS `open`, Docker Desktop, and Keychain integrations are detected only on macOS
-- Linux uses `xdg-open` when available and `$HOME/Backups` / `${XDG_CACHE_HOME:-$HOME/.cache}` for backup staging
-
-## Sensitive Files
-
-For encrypted local secrets, this repo ships `vaultcrypt`, a contained native
-binary built from a single C file with no Homebrew dependency.
-
-Properties:
-
-- macOS only
-- no Brew dependency
-- single source file: [scripts/vaultcrypt/vaultcrypt.c](/Users/anakin/.dotfiles/scripts/vaultcrypt/vaultcrypt.c)
-- file format is documented in the source header for recovery
-- algorithms are fixed:
-  - `PBKDF2-HMAC-SHA256`
-  - `AES-256-CTR`
-  - `HMAC-SHA256` over `header || ciphertext`
-
-Examples:
-
-```bash
-vaultcrypt enc -i wallet-seed.txt
-vaultcrypt dec -i wallet-seed.txt.vlt -o -
-vaultcrypt info -i wallet-seed.txt.vlt
-vaultcrypt info --json -i wallet-seed.txt.vlt
-vaultcrypt enc -i wallet-seed.txt --passphrase-keychain-service vaultcrypt-documents
-vaultcrypt syncdir -i ~/Documents -o ~/Backups/Documents.vault
-vaultcrypt restoredir -i ~/Backups/Documents.vault -o ~/Documents.restore
-vaultcrypt selftest
-```
-
-Practical rules:
-
-- Do not commit plaintext seed phrases to this repo
-- Keep the passphrase separate from the ciphertext
-- Test decryption immediately after creating a backup
-- Use `-o -` or `--stdout` explicitly if you want decrypted plaintext on stdout
-- `syncdir` stores an encrypted manifest so it can skip unchanged files on the next run
-- `syncdir` and `restoredir` preserve plaintext filenames and directory names; they encrypt file contents, not path metadata
-- Keychain mode uses a generic password item selected by service and optional account; if account is omitted, `vaultcrypt` uses `$USER`
-
-Recovery note:
-- `vaultcrypt info` prints the full header, including the raw header hex plus the salt and IV
-- the ciphertext stores the algorithm and KDF metadata needed for recovery with another implementation
-- if you lose the tool, the source comment at the top of `vaultcrypt.c` still describes the exact header and key derivation needed to decrypt with another implementation
+- `~/.bash_profile` is a small **local** file written by the installer that
+  sources [.bash_profile](.bash_profile). Tool installers (bun, IDEs, …) that
+  append PATH lines edit that local file, not this repo.
+- [.bash_profile](.bash_profile): PATH and environment only.
+- [.bashrc](.bashrc): interactive settings, prompt, aliases.
+- `~/.bashrc.local`: machine-specific interactive settings
+  (see [.bashrc.local.example](.bashrc.local.example)).
+- `~/.secrets/api_keys.sh`: sourced by `.bashrc` if present (keep it `chmod 700`).
+- [scripts/lib/manifest.sh](scripts/lib/manifest.sh): what each profile links and builds.
+- When install replaces an existing file, it is moved to
+  `~/.dotfiles-backup/<timestamp>/`.
 
 ## Shell
 
-Shell behavior comes from [.bashrc](/Users/anakin/.dotfiles/.bashrc) and [.bash_profile](/Users/anakin/.dotfiles/.bash_profile).
+- Prompt: `[user@host:/s/h/o/rt/path] (branch*)`. Path, branch and virtualenv
+  are inserted as plain text, so odd folder or branch names can't run code.
+- History: 50k entries, shared across sessions, timestamps, no duplicates.
+- `minifetch` runs in top-level interactive shells; `zoxide` replaces `cd` when installed.
+- `fzf` uses `fd` for files and `bat` for previews (`Ctrl-T`, `Ctrl-R`).
+- `vim` with no arguments opens an `fzf` file picker when `fzf` is installed.
 
-### Startup
+Functions: `mkcd <dir>`, `up [N]`, `icloud` (macOS), `drive` (Google Drive, macOS).
 
-`.bash_profile`:
-
-- prepends `~/bin`
-- prepends `~/.local/bin`
-- appends Docker Desktop CLI path
-- runs `brew shellenv` before loading `.bashrc`
-- supports both `/opt/homebrew/bin/brew` and `/usr/local/bin/brew`
-- suppresses Bash deprecation warnings
-- prepends Antigravity path if present
-- loads `.bashrc`
-
-`.bashrc`:
-
-- exits immediately for non-interactive shells
-- loads Homebrew Bash completion when available
-- enables:
-  - `histappend`
-  - `checkwinsize`
-  - `cmdhist`
-  - `extglob`
-- sets:
-  - `HISTSIZE=50000`
-  - `HISTFILESIZE=100000`
-  - `HISTCONTROL=ignoreboth:erasedups`
-  - `HISTTIMEFORMAT="%d-%m-%Y %H:%M:%S "`
-  - `EDITOR=vim`
-- runs `minifetch` on top-level interactive shells if installed
-- initializes `zoxide` at the end
-
-### Prompt
-
-The prompt shows:
-
-- username
-- hostname
-- shortened current path
-- current git branch and dirty marker via `gitprompt`
-
-Notes:
-
-- path is compressed by `short_path()`
-- git state is computed by the compiled `gitprompt` helper, not inline shell `git` calls
-
-### Aliases
-
-Current shell aliases:
-
-- `..='cd ..'`
-- `...='cd ../../../'`
-- `icloud='cd ~/Library/Mobile\ Documents/com~apple~CloudDocs/'`
-- `l='ls -lah'`
-- `la='ls -lAh'`
-- `ll='ls -lh'`
-- `v='vim'`
-- `h='history'`
-- `c='clear'`
-- `o='open .'`
-
-Diff and grep:
-
-- `diff='colordiff -u'` if `colordiff` exists, otherwise `diff='diff -u'`
-- `grep='grep --color=auto'`
-- `egrep='grep -E --color=auto'`
-- `fgrep='grep -F --color=auto'`
-
-Linux-only package aliases:
-
-- `apt='sudo apt'`
-- `apt-get='sudo apt'`
-- `update='apt update'`
-- `upgrade='apt upgrade'`
-- `install='apt install'`
-- `remove='apt remove'`
-
-### Shell Functions
-
-- `short_path()`: compresses `$PWD` for the prompt
-- `mkcd <dir>`: creates a directory and enters it
-- `up [N]`: moves up `N` directories
-- `prompt_update()`: rebuilds `PS1` and queries `gitprompt`
-
-### File and Content Search
-
-Configured behavior:
-
-- `fd` is the default file source for `fzf`
-- `bat` is used for `fzf` file previews
-- `ripgrep` is separate and used directly via `rg`
-
-Examples:
-
-- find files by name:
-  ```bash
-  fd minifetch
-  ```
-- fuzzy-pick files:
-  ```bash
-  fd | fzf
-  ```
-- search file contents:
-  ```bash
-  rg "pattern"
-  ```
-- fuzzy-pick from content matches:
-  ```bash
-  rg "pattern" | fzf
-  ```
-
-### FZF
-
-Configured in `.bashrc`:
-
-- `FZF_DEFAULT_COMMAND='fd --type f --hidden --follow --exclude .git'`
-- `FZF_CTRL_T_COMMAND="$FZF_DEFAULT_COMMAND"`
-- `FZF_CTRL_T_OPTS='--preview "bat --style=numbers --color=always --line-range=:200 {}"'` when `bat` exists
-
-Also sources Homebrew `fzf` Bash integration when available:
-
-- `/opt/homebrew/opt/fzf/shell/completion.bash`
-- `/opt/homebrew/opt/fzf/shell/key-bindings.bash`
-- fallback to `/usr/local/opt/fzf/...`
-
-Practical usage:
-
-- `Ctrl-T`: fuzzy-pick a file path into the current command line
-- `Ctrl-R`: fuzzy-search shell history from the upstream `fzf` script
-
-### Zoxide
-
-Configured with:
-
-```bash
-eval "$(zoxide init bash)"
-```
-
-Usage:
-
-- `z foo`: jump to a frequently used directory matching `foo`
-- `zi`: interactive directory picker
+Aliases: `..`, `...`, `l`, `la`, `ll`, `v`, `h`, `c`, `o` (open current dir),
+colored `grep`/`diff`. On Linux only: `apt`/`install`/`update`/`upgrade`/`remove`
+run through `sudo apt`.
 
 ## Vim
 
-Behavior comes from [.vim/vimrc](/Users/anakin/.dotfiles/.vim/vimrc).
+[.vim/vimrc](.vim/vimrc): built-in features only, vendored gruvbox, system
+clipboard, persistent undo, relative numbers, 2-space indent (4 for Python),
+trailing whitespace trimmed on save (except Markdown).
 
-### Goals
+Leader is `Space`:
 
-- modern defaults
-- minimal config
-- built-in features only
-- system clipboard by default
-- vendored `gruvbox` colorscheme for consistent installs
-
-### Core Features
-
-- UTF-8 encoding
-- syntax highlighting
-- filetype plugins and indent
-- `gruvbox` if available, otherwise Vim continues silently
-- line numbers and relative numbers
-- cursor line
-- sign column always on
-- split right / split below
-- mouse enabled
-- persistent undo
-- case-smart searching
-- search highlighting
-- autoindent and smartindent
-
-### Clipboard
-
-Clipboard is the first priority in the current Vim setup.
-
-Configured with:
-
-```vim
-set clipboard=unnamed,unnamedplus
-```
-
-That means normal Vim copy/paste uses the system clipboard when supported:
-
-- `y`
-- `yy`
-- `p`
-- `P`
-
-This machine’s Vim supports `+clipboard`.
-
-### Vim Leader
-
-Leader is:
-
-```vim
-let mapleader=" "
-```
-
-So the leader key is `Space`.
-
-### Vim Keybindings
-
-Current custom mappings:
-
-- `Ctrl-h`: move to left split
-- `Ctrl-j`: move to lower split
-- `Ctrl-k`: move to upper split
-- `Ctrl-l`: move to right split
-- `Space w`: save current file
-- `Space Space`: clear search highlighting
-- `Space e`: open netrw explorer with `:Lex 20`
-- `Space y f`: copy current file path to clipboard
-- `Space y d`: copy current file directory to clipboard
-
-### Vim Autocommands
-
-- trim trailing whitespace on save, except Markdown
-- restore last cursor position on reopen
-- Python uses 4 spaces
-- JS/TS/TSX/JSX/HTML/CSS use 2 spaces
+| Keys | Action |
+|---|---|
+| `Ctrl-h/j/k/l` | move between splits |
+| `Space w` | save |
+| `Space Space` | clear search highlight |
+| `Space e` | file explorer (`:Lex 20`) |
+| `Space y f` / `Space y d` | copy file path / directory |
 
 ## Git
 
-Git behavior comes from [.gitconfig](/Users/anakin/.dotfiles/.gitconfig).
+[.gitconfig](.gitconfig): `pull.rebase`, `fetch.prune`, aliases `st`, `co`, `br`, `lg`.
+Repos under `~/Developer/msu/` use [.gitconfig.msu](.gitconfig.msu).
 
-Defaults:
+## Tools
 
-- `pull.rebase = true`
-- `fetch.prune = true`
-- `init.defaultBranch = master`
+| Tool | Source | What it does |
+|---|---|---|
+| `minifetch` | [scripts/minifetch.c](scripts/minifetch.c) | system summary with ASCII art (`--no-color`, `--field NAME`) |
+| `gitprompt` | [scripts/gitprompt.c](scripts/gitprompt.c) | branch and dirty marker for the prompt, read straight from `.git` |
+| `ftree` | [scripts/ftree.c](scripts/ftree.c) | tree viewer: `ftree -a -L 2`, `ftree -I .git,node_modules --sort size -s` |
+| `shamir` | [scripts/shamir.c](scripts/shamir.c) | Shamir secret sharing: `shamir split -t 2 -n 3 < secret`, `shamir combine` |
+| `auther` | [scripts/auther/auther.py](scripts/auther/auther.py) | TOTP codes from the Keychain: `auther`, `auther add`, `auther copy <name>` |
+| `backup` | [scripts/backup.sh](scripts/backup.sh) | encrypted snapshot of a folder with vaultcrypt, uploaded with rclone |
+| `restore` | [scripts/restore.sh](scripts/restore.sh) | decrypt a vaultcrypt backup |
+| `dotfiles-doctor` | [scripts/doctor.sh](scripts/doctor.sh) | check the install |
 
-Aliases:
+`backup` and `restore` need `vaultcrypt`, which now lives in its own repo;
+install it to `~/bin/vaultcrypt` from there. Note that
+[.vaultcrypt.conf](.vaultcrypt.conf) excludes archives (`*.zip`, `*.tar`, …),
+keys (`*.pem`, `*.key`) and build/log folders from backups.
 
-- `git st`: `git status -sb`
-- `git co`: `git checkout`
-- `git br`: `git branch`
-- `git lg`: `git log --graph --decorate --oneline --all`
-
-## Local Tools
-
-### `minifetch`
-
-Source: [scripts/minifetch.c](/Users/anakin/.dotfiles/scripts/minifetch.c)
-
-Purpose:
-
-- prints a compact system summary with ASCII art
-
-Fields shown:
-
-- OS
-- Host
-- Kernel
-- Uptime
-- Shell
-- Terminal
-- Resolution
-- CPU
-- Cores
-- GPU
-- Temps
-- Load
-- Memory
-- Swap
-- Battery
-- Battery Health
-- Local IP
-- Disk
-- Packages
-
-Usage:
-
-```bash
-minifetch
-minifetch --no-color
-```
-
-### `gitprompt`
-
-Source: [scripts/gitprompt.c](/Users/anakin/.dotfiles/scripts/gitprompt.c)
-
-Purpose:
-
-- fast git prompt helper for Bash
-- prints current branch and `*` for dirty state
-
-Example output:
-
-```text
- (main*)
-```
-
-### `ftree`
-
-Source: [scripts/ftree.c](/Users/anakin/.dotfiles/scripts/ftree.c)
-
-Purpose:
-
-- small tree-style directory viewer
-
-Examples:
-
-```bash
-ftree
-ftree -a -L 2 ~/Developer
-ftree -I .git,node_modules --sort size -s
-```
-
-## Local Overrides
-
-If present, `.bashrc` loads:
-
-```bash
-~/.bashrc.local
-```
-
-Use that for machine-specific overrides without changing the repo.
+Notes and plans live in [docs/](docs/).

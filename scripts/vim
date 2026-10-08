@@ -2,7 +2,8 @@
 
 real_vim="/usr/bin/vim"
 
-if [ "$#" -eq 0 ] && [ -t 0 ] && [ -t 1 ]; then
+# With no arguments, pick files with fzf when it is available.
+if [ "$#" -eq 0 ] && [ -t 0 ] && [ -t 1 ] && command -v fzf >/dev/null 2>&1; then
   files=()
 
   while IFS= read -r -d '' file; do
