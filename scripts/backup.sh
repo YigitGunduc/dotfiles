@@ -7,7 +7,7 @@ set -euo pipefail
 # --- Configuration ---
 # Target destination on Google Drive
 if [[ "$(uname -s)" == "Darwin" ]]; then
-    DEFAULT_DEST_ROOT="/Users/anakin/Library/CloudStorage/GoogleDrive-ygunduc@gmail.com/My Drive/Backups"
+    DEFAULT_DEST_ROOT="$HOME/Library/CloudStorage/GoogleDrive-ygunduc@gmail.com/My Drive/Backups"
     LOCAL_STAGE_ROOT_DEFAULT="$HOME/Library/Caches/vaultcrypt-backups"
 else
     DEFAULT_DEST_ROOT="$HOME/Backups"
@@ -154,11 +154,16 @@ fi
 "$VAULTCRYPT_BIN" syncdir -i "$SOURCE_DIR" -o "$LATEST_STAGE" \
     "${VAULTCRYPT_ARGS[@]}"
 
-# 8. Create instant APFS clone for the cloud upload
+# 8. Snapshot the stage for the cloud upload (APFS clone on macOS)
 if [ -z "$DRY_RUN" ]; then
-    echo "Cloning snapshot (APFS)..."
     rm -rf "$SNAPSHOT_STAGE" # Ensure clean state
-    cp -Rc "$LATEST_STAGE" "$SNAPSHOT_STAGE"
+    if [[ "$(uname -s)" == "Darwin" ]]; then
+        echo "Cloning snapshot (APFS)..."
+        cp -Rc "$LATEST_STAGE" "$SNAPSHOT_STAGE"
+    else
+        echo "Copying snapshot (reflink when supported)..."
+        cp -a --reflink=auto "$LATEST_STAGE" "$SNAPSHOT_STAGE"
+    fi
     
     # 9. Sync to Google Drive
     echo "Syncing to Google Drive..."

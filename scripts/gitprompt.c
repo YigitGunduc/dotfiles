@@ -20,6 +20,10 @@
 #define HEAD_REF_PREFIX "ref: "
 #define HEADS_PREFIX "refs/heads/"
 #define HEX_SHORT_LEN 7
+#define INDEX_ENTRY_HEAD_LEN 62
+#define INDEX_FLAG_ASSUME_VALID 0x8000U
+#define INDEX_FLAG_EXTENDED 0x4000U
+#define INDEX_EXT_SKIP_WORKTREE 0x4000U
 
 typedef struct {
   char worktree[PATH_MAX];
@@ -263,7 +267,7 @@ static bool stat_matches_index(const char *path, uint32_t mode, uint32_t size,
   if ((uint32_t) st.st_mtimespec.tv_nsec != mtime_nsec) {
     return false;
   }
-#elif defined(st_mtim)
+#elif defined(__linux__)
   if ((uint32_t) st.st_mtim.tv_nsec != mtime_nsec) {
     return false;
   }
@@ -307,8 +311,9 @@ static bool repo_is_dirty(RepoInfo *repo) {
   }
 
   for (i = 0; i < entries; i++) {
-    unsigned char entry_head[62];
+    unsigned char entry_head[INDEX_ENTRY_HEAD_LEN];
     uint16_t flags;
+    uint16_t ext_flags = 0;
     uint16_t stage;
     uint32_t mode;
     uint32_t mtime_sec;
@@ -318,7 +323,7 @@ static bool repo_is_dirty(RepoInfo *repo) {
     char entry_path[PATH_MAX];
     char full_path[PATH_MAX * 2];
     int ch;
-    long entry_bytes;
+    long entry_bytes = INDEX_ENTRY_HEAD_LEN;
     long padding;
 
     if (fread(entry_head, 1, sizeof(entry_head), fp) != sizeof(entry_head)) {
@@ -332,6 +337,18 @@ static bool repo_is_dirty(RepoInfo *repo) {
     size = read_be32(entry_head + 36);
     flags = (uint16_t) ((entry_head[60] << 8) | entry_head[61]);
     stage = (uint16_t) ((flags >> 12) & 0x3);
+
+    /* v3+ entries with the extended flag carry 2 more flag bytes. */
+    if ((flags & INDEX_FLAG_EXTENDED) != 0) {
+      unsigned char ext[2];
+
+      if (version < 3 || fread(ext, 1, sizeof(ext), fp) != sizeof(ext)) {
+        fclose(fp);
+        return false;
+      }
+      ext_flags = (uint16_t) ((ext[0] << 8) | ext[1]);
+      entry_bytes += 2L;
+    }
 
     for (;;) {
       ch = fgetc(fp);
@@ -348,14 +365,16 @@ static bool repo_is_dirty(RepoInfo *repo) {
     }
     entry_path[path_len] = '\0';
 
-    entry_bytes = 62L + (long) path_len + 1L;
+    entry_bytes += (long) path_len + 1L;
     padding = (8L - (entry_bytes % 8L)) % 8L;
     if (fseek(fp, padding, SEEK_CUR) != 0) {
       fclose(fp);
       return false;
     }
 
-    if (stage != 0) {
+    /* git status ignores assume-unchanged and skip-worktree entries. */
+    if (stage != 0 || (flags & INDEX_FLAG_ASSUME_VALID) != 0 ||
+        (ext_flags & INDEX_EXT_SKIP_WORKTREE) != 0) {
       continue;
     }
 

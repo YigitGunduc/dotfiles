@@ -997,16 +997,7 @@ static void get_os_name(char *out, size_t out_size) {
 }
 
 static void get_uptime_string(char *out, size_t out_size) {
-#ifdef CLOCK_UPTIME_RAW
-  struct timespec uptime_ts;
-
-  if (clock_gettime(CLOCK_UPTIME_RAW, &uptime_ts) == 0 &&
-      uptime_ts.tv_sec > 0) {
-    format_uptime((unsigned long long) uptime_ts.tv_sec, out, out_size);
-    return;
-  }
-#endif
-
+  /* kern.boottime includes time asleep, matching uptime(1). */
   struct timeval boot_time;
   time_t now = time(NULL);
 

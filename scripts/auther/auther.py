@@ -35,6 +35,7 @@ except ModuleNotFoundError:
 
 APP_NAME = "luminum-auth"
 INDEX_ACCOUNT = "__services__"
+SUBCOMMANDS = {"add", "show", "remove", "copy", "list", "app"}
 ACCENT = "bold cyan"
 SUCCESS = "bold green"
 WARNING = "bold yellow"
@@ -484,7 +485,7 @@ def dashboard_help_plain() -> str:
     )
 
 
-def dashboard_command_loop() -> tuple[str, str | None]:
+def dashboard_command_loop(initial_message: str | None = None) -> tuple[str, str | None]:
     def draw(stdscr: curses.window, input_buffer: str, message: str | None) -> None:
         stdscr.erase()
         height, width = stdscr.getmaxyx()
@@ -555,7 +556,7 @@ def dashboard_command_loop() -> tuple[str, str | None]:
         stdscr.keypad(True)
         stdscr.timeout(250)
         input_buffer = ""
-        message = dashboard_help_plain()
+        message = initial_message or dashboard_help_plain()
         last_refresh = 0.0
 
         while True:
@@ -575,7 +576,10 @@ def dashboard_command_loop() -> tuple[str, str | None]:
                     message = None
                     draw(stdscr, input_buffer, message)
                     continue
-                action, argument, new_message = process_command(raw)
+                try:
+                    action, argument, new_message = process_command(raw)
+                except AuthError as exc:
+                    action, argument, new_message = "stay", None, f"Error: {exc}"
                 if new_message is not None:
                     message = new_message
                 else:
@@ -603,20 +607,21 @@ def run_dashboard(once: bool = False) -> int:
     if once:
         console.print(render_dashboard(dashboard_help()))
         return 0
+    message = None
     while True:
-        action, argument = dashboard_command_loop()
+        action, argument = dashboard_command_loop(message)
+        message = None
         if action == "quit":
             return 0
-        if action == "show" and argument:
-            show_code(argument)
-            continue
-        if action == "add":
-            store_secret_interactive(argument)
-            continue
-        if action == "remove" and argument:
-            remove_service(argument)
-            continue
-    return 0
+        try:
+            if action == "show" and argument:
+                show_code(argument)
+            elif action == "add":
+                store_secret_interactive(argument)
+            elif action == "remove" and argument:
+                remove_service(argument)
+        except AuthError as exc:
+            message = f"Error: {exc}"
 
 
 def show_code(service: str, once: bool = False, reveal_uri: bool = False) -> int:
@@ -690,7 +695,7 @@ def compat_args(argv: list[str]) -> list[str]:
         return argv
     if argv[0] == "--add":
         return ["add", *argv[1:]]
-    if argv[0].startswith("-"):
+    if argv[0].startswith("-") or argv[0] in SUBCOMMANDS:
         return argv
     return ["show", *argv]
 

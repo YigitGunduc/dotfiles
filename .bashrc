@@ -164,10 +164,14 @@ prompt_update() {
     env_prompt="(${CONDA_DEFAULT_ENV}) "
   fi
 
+  # Values come from the filesystem/git, so reference them by name: bash
+  # expands \${var} in PS1 once and never re-evaluates $(...) inside it.
+  PROMPT_ENV="$env_prompt"
+  PROMPT_PATH="$prompt_path"
   if [[ "$color_prompt" == "yes" ]]; then
-    PS1="\[\e[96m\]${env_prompt}\[\e[m\][\[\e[92m\]\u\[\e[m\]${host_separator}\[\e[94m\]\h\[\e[m\]:\[\e[93m\]${prompt_path}\[\e[m\]]\[\e[91m\]${PROMPT_GIT}\[\e[m\] \\$ "
+    PS1="\[\e[96m\]\${PROMPT_ENV}\[\e[m\][\[\e[92m\]\u\[\e[m\]${host_separator}\[\e[94m\]\h\[\e[m\]:\[\e[93m\]\${PROMPT_PATH}\[\e[m\]]\[\e[91m\]\${PROMPT_GIT}\[\e[m\] \\$ "
   else
-    PS1="${env_prompt}[\u@\h:${prompt_path}]${PROMPT_GIT} \\$ "
+    PS1="\${PROMPT_ENV}[\u@\h:\${PROMPT_PATH}]\${PROMPT_GIT} \\$ "
   fi
 }
 
@@ -204,7 +208,7 @@ alias egrep='grep -E --color=auto'
 alias fgrep='grep -F --color=auto'
 
 # Package shortcuts (Linux only)
-if [[ $IS_LINUX ]]; then
+if [[ $IS_LINUX -eq 1 ]]; then
   alias apt='sudo apt'
   alias apt-get='sudo apt'
   alias update='apt update'

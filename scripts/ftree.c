@@ -897,7 +897,13 @@ static int print_root_and_walk(const char *path) {
                        (root.st.st_mode & (S_IXUSR | S_IXGRP | S_IXOTH));
 
   if (root.is_symlink) {
+    struct stat target_st;
+
     root.link_target = read_link_target(path, &root.st);
+    /* Like tree(1), descend into a root that links to a directory. */
+    if (stat(path, &target_st) == 0 && S_ISDIR(target_st.st_mode)) {
+      root.is_dir = true;
+    }
   }
 
   if (g_cfg.full_path) {
