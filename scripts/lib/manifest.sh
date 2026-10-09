@@ -5,6 +5,7 @@ COMMON_LINKS=(
   ".bashrc|.bashrc"
   ".gitconfig|.gitconfig"
   ".gitconfig.msu|.gitconfig.msu"
+  ".tmux.conf|.tmux.conf"
   ".vim/vimrc|.vim/vimrc"
   ".vim/colors/gruvbox.vim|.vim/colors/gruvbox.vim"
   "scripts/vim|bin/vim"
@@ -21,7 +22,7 @@ FULL_LINKS=(
 C_TOOLS=(minifetch gitprompt ftree shamir)
 
 # Commands .bashrc uses when present. Missing ones only lose a convenience.
-OPTIONAL_COMMANDS=(fzf rg zoxide colordiff)
+OPTIONAL_COMMANDS=(tmux fzf rg zoxide colordiff)
 
 PROFILE_FILE=".local/share/dotfiles/profile"
 BACKUP_ROOT=".dotfiles-backup"

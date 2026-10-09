@@ -19,7 +19,7 @@ The installer picks a profile from the OS. Override it with `--minimal` or `--fu
 
 | | **minimal** (Linux default) | **full** (macOS default) |
 |---|---|---|
-| Bash, Git, Vim config | ✓ | ✓ |
+| Bash, Git, Vim, tmux config | ✓ | ✓ |
 | `minifetch`, `gitprompt`, `ftree`, `shamir` (built with `cc`) | ✓ if `cc` exists | ✓ (requires `cc`) |
 | Packages ([Brewfile](Brewfile) / apt) | – | ✓ |
 | `backup`, `restore`, `.vaultcrypt.conf` | – | ✓ |
@@ -91,6 +91,22 @@ Leader is `Space`:
 | `Space Space` | clear search highlight |
 | `Space e` | file explorer (`:Lex 20`) |
 | `Space y f` / `Space y d` | copy file path / directory |
+
+## tmux
+
+[.tmux.conf](.tmux.conf): plugin-free, prefix `Ctrl-a`, mouse on,
+windows numbered from 1 (renumbered on close), 100k scrollback, true color and a gruvbox status bar.
+tmux itself is installed by the full profile; minimal only links the config.
+
+| Keys | Action |
+|---|---|
+| `Ctrl-h/j/k/l` | move between panes (passed through to vim and fzf) |
+| `prefix \|` / `prefix -` | split side by side / stacked, in the current directory |
+| `prefix H/J/K/L` | resize pane (repeatable) |
+| `prefix Ctrl-l` | clear the screen (plain `Ctrl-l` moves panes) |
+| `prefix Ctrl-a` | send a literal `Ctrl-a` (start of line in bash) |
+| `prefix [` then `v`, `y` | copy mode: select, copy to the system clipboard |
+| `prefix r` | reload the config |
 
 ## Git
 

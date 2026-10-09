@@ -102,7 +102,7 @@ ensure_linux_packages() {
   # Keep the feature set aligned with Brewfile. fdfind/batcat are Ubuntu names.
   # Use the compiler pieces directly: build-essential also pulls dpkg-dev,
   # which requires bzip2 on some minimal Ubuntu/Pi images.
-  for package in gcc make libc6-dev python3 python3-venv vim fzf ripgrep fd-find bat colordiff zoxide rclone; do
+  for package in gcc make libc6-dev python3 python3-venv vim tmux fzf ripgrep fd-find bat colordiff zoxide rclone; do
     if dpkg-query -W -f='${Status}' "$package" 2>/dev/null | grep -q 'install ok installed'; then
       continue
     fi
